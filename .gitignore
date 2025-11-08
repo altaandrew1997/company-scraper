@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.swp
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE / editor files
+.vscode/
+.idea/
+
+# Local data caches and outputs
+data/*.json
+output/
+.sessions
+
+# OS files
+.DS_Store
+Thumbs.db
+

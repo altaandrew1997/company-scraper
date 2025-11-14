@@ -94,65 +94,87 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
         
         # Set up extractor to get sitekey
         extractor = CloudflareTurnstileExtractor()
-        await extractor.setup_network_monitoring(page)
         
-        # Inject turnstile interceptor
-        await page.evaluate("""
-            window.turnstileParams = null;
-            const interval = setInterval(() => {
-                if (window.turnstile) {
-                    clearInterval(interval);
-                    const originalRender = window.turnstile.render;
-                    window.turnstile.render = function(container, options) {
-                        window.turnstileParams = {
-                            sitekey: options.sitekey,
-                            action: options.action || null,
-                            cData: options.cData || null,
-                            chlPageData: options.chlPageData || null,
-                            callback: options.callback || null
-                        };
-                        if (originalRender) {
-                            return originalRender.call(this, container, options);
-                        }
-                        return 'foo';
-                    };
-                }
-            }, 10);
-        """)
+        # FIRST: Check if sitekey was already captured in window.turnstileParams
+        # (from initial get_bypassed_page call - don't reset it!)
+        existing_params = await page.evaluate("() => window.turnstileParams")
+        if existing_params and existing_params.get('sitekey'):
+            existing_sitekey = existing_params['sitekey']
+            if extractor._is_valid_turnstile_sitekey(existing_sitekey):
+                logger.info(f"✅ Using previously captured sitekey from window.turnstileParams: {existing_sitekey}")
+                sitekey = existing_sitekey
+                turnstile_params = existing_params
+            else:
+                logger.debug(f"Existing turnstileParams found but invalid sitekey: {existing_sitekey}")
+                existing_params = None
         
-        # Wait for challenge to load and turnstile to render
-        await page.wait_for_timeout(5000)
-        
-        # Try to trigger turnstile render if it hasn't rendered yet
-        await page.evaluate("""
-            () => {
-                // Try to find and render turnstile if it exists but hasn't rendered
-                if (window.turnstile && typeof window.turnstile.render === 'function') {
-                    const containers = document.querySelectorAll('[data-sitekey]');
-                    containers.forEach(container => {
-                        if (!container.querySelector('iframe')) {
-                            try {
-                                window.turnstile.render(container, {
-                                    sitekey: container.getAttribute('data-sitekey'),
-                                    callback: function(token) {
-                                        console.log('Turnstile rendered with token');
+        # Only set up network monitoring if we don't have a valid sitekey already
+        if not existing_params:
+            logger.debug("No existing sitekey found, setting up network monitoring...")
+            await extractor.setup_network_monitoring(page)
+            
+            # Inject turnstile interceptor (only reset if not already set)
+            await page.evaluate("""
+                () => {
+                    // Only reset if turnstileParams doesn't exist or is null/empty
+                    if (!window.turnstileParams || !window.turnstileParams.sitekey) {
+                        window.turnstileParams = null;
+                        const interval = setInterval(() => {
+                            if (window.turnstile) {
+                                clearInterval(interval);
+                                const originalRender = window.turnstile.render;
+                                window.turnstile.render = function(container, options) {
+                                    window.turnstileParams = {
+                                        sitekey: options.sitekey,
+                                        action: options.action || null,
+                                        cData: options.cData || null,
+                                        chlPageData: options.chlPageData || null,
+                                        callback: options.callback || null
+                                    };
+                                    if (originalRender) {
+                                        return originalRender.call(this, container, options);
                                     }
-                                });
-                            } catch(e) {
-                                console.log('Error rendering turnstile:', e);
+                                    return 'foo';
+                                };
                             }
-                        }
-                    });
+                        }, 10);
+                    }
                 }
-            }
-        """)
-        
-        # Wait a bit more for turnstile to potentially render
-        await page.wait_for_timeout(3000)
-        
-        # Extract sitekey
-        sitekey = await extractor.get_sitekey(page)
-        turnstile_params = await page.evaluate("() => window.turnstileParams")
+            """)
+            
+            # Wait for challenge to load and turnstile to render
+            await page.wait_for_timeout(5000)
+            
+            # Try to trigger turnstile render if it hasn't rendered yet
+            await page.evaluate("""
+                () => {
+                    // Try to find and render turnstile if it exists but hasn't rendered
+                    if (window.turnstile && typeof window.turnstile.render === 'function') {
+                        const containers = document.querySelectorAll('[data-sitekey]');
+                        containers.forEach(container => {
+                            if (!container.querySelector('iframe')) {
+                                try {
+                                    window.turnstile.render(container, {
+                                        sitekey: container.getAttribute('data-sitekey'),
+                                        callback: function(token) {
+                                            console.log('Turnstile rendered with token');
+                                        }
+                                    });
+                                } catch(e) {
+                                    console.log('Error rendering turnstile:', e);
+                                }
+                            }
+                        });
+                    }
+                }
+            """)
+            
+            # Wait a bit more for turnstile to potentially render
+            await page.wait_for_timeout(3000)
+            
+            # Extract sitekey from network
+            sitekey = await extractor.get_sitekey(page, wait_time=10000)  # Increased wait time
+            turnstile_params = await page.evaluate("() => window.turnstileParams")
         
         if not sitekey:
             logger.error("❌ Could not extract sitekey from Cloudflare challenge")

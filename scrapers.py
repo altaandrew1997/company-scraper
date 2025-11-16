@@ -18,6 +18,38 @@ from cloudflare_utils import is_session_valid
 from naics_classifier_ai import enrich_naics_codes_ai as enrich_naics_codes
 
 
+def setup_logging(log_filename: str = None):
+    """
+    Set up logging to both console and file
+    
+    Args:
+        log_filename: Name of the log file (default: logs/scraper_YYYYMMDD_HHMMSS.log)
+    """
+    # Create logs directory if it doesn't exist
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # Generate log filename with timestamp if not provided
+    if not log_filename:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_filename = f"scraper_{timestamp}.log"
+    
+    log_path = log_dir / log_filename
+    
+    # Add file handler to logger (loguru automatically handles console)
+    logger.add(
+        log_path,
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        level="DEBUG",
+        rotation="10 MB",  # Rotate when file reaches 10MB
+        retention="7 days",  # Keep logs for 7 days
+        compression="zip"  # Compress rotated logs
+    )
+    
+    logger.info(f"📝 Logging to file: {log_path}")
+    return log_path
+
+
 async def human_delay(min_seconds: float = 0.5, max_seconds: float = 2.0):
     """
     Random delay to simulate human behavior
@@ -995,6 +1027,9 @@ async def main(excel_file_path: Optional[str] = None, detail_only: bool = False)
         excel_file_path: Optional path to existing Excel file (for detail-only mode)
         detail_only: If True, only run detail page enrichment (requires excel_file_path)
     """
+    # Set up logging to file
+    log_path = setup_logging()
+    
     search_term = "landscap"
     
     try:

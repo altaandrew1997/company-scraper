@@ -262,13 +262,20 @@ class CloudflareTurnstileExtractor:
             page: Playwright page object
             wait_time: How long to wait for network requests (ms)
         """
+        # DEBUG: Log entry point
+        logger.debug(f"DEBUG get_sitekey(): ENTRY - sitekey_from_network={repr(self.sitekey_from_network)}, captured_requests={len(self.captured_requests)}")
+        
         # Check if we already found the sitekey
         if self.sitekey_from_network:
             logger.info(f"Sitekey already found via network monitoring: {self.sitekey_from_network}")
+            logger.debug(f"DEBUG get_sitekey(): RETURNING early with sitekey: {self.sitekey_from_network}")
             return self.sitekey_from_network
+        else:
+            logger.debug(f"DEBUG get_sitekey(): sitekey_from_network is falsy: {repr(self.sitekey_from_network)}")
         
         # Check already captured requests first (in case monitoring was set up earlier)
         if self.captured_requests:
+            logger.debug(f"DEBUG get_sitekey(): Checking {len(self.captured_requests)} captured requests")
             logger.info(f"Checking {len(self.captured_requests)} already captured network requests...")
             
             # First pass: prioritize Turnstile URLs
@@ -300,31 +307,44 @@ class CloudflareTurnstileExtractor:
                     return sitekey
         
         # Set up network monitoring if not already done
+        logger.debug(f"DEBUG get_sitekey(): Setting up network monitoring (if not already done)")
         await self.setup_network_monitoring(page)
         
         # Wait for network requests to be captured
+        logger.debug(f"DEBUG get_sitekey(): Waiting {wait_time}ms for network requests")
         await page.wait_for_timeout(wait_time)
+        logger.debug(f"DEBUG get_sitekey(): After wait - sitekey_from_network={repr(self.sitekey_from_network)}, captured_requests={len(self.captured_requests)}")
         
         # Check if we got sitekey from network
         if self.sitekey_from_network:
             logger.info(f"Sitekey found via network monitoring: {self.sitekey_from_network}")
+            logger.debug(f"DEBUG get_sitekey(): RETURNING after wait with sitekey: {self.sitekey_from_network}")
             return self.sitekey_from_network
+        else:
+            logger.debug(f"DEBUG get_sitekey(): After wait, sitekey_from_network still falsy: {repr(self.sitekey_from_network)}")
         
         # Check captured requests one more time (with validation)
         if self.captured_requests:
+            logger.debug(f"DEBUG get_sitekey(): Final check - validating {len(self.captured_requests)} captured requests")
             logger.info(f"Final check: validating {len(self.captured_requests)} captured network requests...")
             
             # Prioritize Turnstile URLs
             turnstile_requests = [r for r in self.captured_requests if 'turnstile' in r.get('url', '').lower()]
             other_requests = [r for r in self.captured_requests if r not in turnstile_requests]
             
-            for req in turnstile_requests + other_requests:
+            for i, req in enumerate(turnstile_requests + other_requests):
+                logger.debug(f"DEBUG get_sitekey(): Checking request {i+1}/{len(turnstile_requests + other_requests)}")
                 sitekey = self._extract_sitekey_from_network_data(req)
+                logger.debug(f"DEBUG get_sitekey():   Extracted: {repr(sitekey)}")
                 if sitekey and self._is_valid_turnstile_sitekey(sitekey):
                     logger.info(f"✅ Found valid sitekey in captured request: {sitekey}")
                     self.sitekey_from_network = sitekey
+                    logger.debug(f"DEBUG get_sitekey(): RETURNING from final check with sitekey: {sitekey}")
                     return sitekey
+        else:
+            logger.debug(f"DEBUG get_sitekey(): No captured requests to check in final pass")
         
+        logger.debug(f"DEBUG get_sitekey(): RETURNING None - no sitekey found anywhere")
         return None
 
 
@@ -1046,12 +1066,38 @@ async def get_bypassed_page(
         
         await page.wait_for_timeout(10000)
         
-        sitekey = await extractor.get_sitekey(page)
-        turnstile_params = await page.evaluate("() => window.turnstileParams")
+        # DEBUG: Check extractor state before calling get_sitekey
+        logger.debug(f"DEBUG: extractor object id: {id(extractor)}")
+        logger.debug(f"DEBUG: extractor.sitekey_from_network = {repr(extractor.sitekey_from_network)}")
+        logger.debug(f"DEBUG: len(extractor.captured_requests) = {len(extractor.captured_requests)}")
+        if extractor.captured_requests:
+            logger.debug(f"DEBUG: Sample captured request URLs:")
+            for i, req in enumerate(extractor.captured_requests[:3]):  # Show first 3
+                logger.debug(f"  [{i}] {req.get('url', 'NO URL')[:100]}")
         
-        if sitekey:
-            logger.info("🔧 Solving Cloudflare challenge...")
-            await solve_cloudflare_challenge(page, context, domain, sitekey, turnstile_params)
+        # Try to get sitekey from network monitoring
+        sitekey = await extractor.get_sitekey(page)
+        
+        # DEBUG: Log result of get_sitekey call
+        logger.debug(f"DEBUG: get_sitekey() returned: {repr(sitekey)}")
+        logger.debug(f"DEBUG: sitekey type: {type(sitekey)}")
+        logger.debug(f"DEBUG: sitekey bool value: {bool(sitekey) if sitekey is not None else 'None'}")
+        logger.debug(f"DEBUG: sitekey == '': {sitekey == '' if sitekey is not None else 'N/A'}")
+        
+        turnstile_params = await page.evaluate("() => window.turnstileParams")
+        logger.debug(f"DEBUG: turnstile_params: {turnstile_params}")
+        
+        # CRITICAL FIX: Fallback to known sitekey if extraction failed
+        if not sitekey:
+            logger.warning("⚠️ Network monitoring didn't capture sitekey")
+            logger.warning(f"⚠️ extractor.sitekey_from_network was: {repr(extractor.sitekey_from_network)}")
+            logger.warning(f"⚠️ Number of captured requests: {len(extractor.captured_requests)}")
+            logger.warning("⚠️ Using known sitekey for ecorp.sos.ga.gov domain as fallback")
+            sitekey = "0x4AAAAAAADnPIDROrmt1Wwj"
+            logger.info(f"✓ Fallback sitekey applied: {sitekey}")
+        
+        logger.info(f"🔧 Solving Cloudflare challenge with sitekey: {sitekey}...")
+        await solve_cloudflare_challenge(page, context, domain, sitekey, turnstile_params)
     
     return (playwright_instance, browser, context, page)
 

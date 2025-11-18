@@ -148,6 +148,10 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
                 # Monitoring already set up - handlers persist across navigations on the same page
                 logger.debug("Network monitoring already active from previous setup")
         
+        # Initialize variables
+        sitekey = None
+        turnstile_params = None
+        
         # FIRST: Check if sitekey was already captured in window.turnstileParams
         # (from initial get_bypassed_page call - don't reset it!)
         existing_params = await page.evaluate("() => window.turnstileParams")
@@ -162,14 +166,20 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
                 existing_params = None
         
         # Check if sitekey was already captured in extractor from previous requests
+        # IMPORTANT: Even if we have sitekey from network, we still need turnstile_params (action, data, pagedata)
+        # for 2captcha API, so we'll inject the interceptor below
         if not existing_params and extractor.sitekey_from_network:
             logger.info(f"✅ Using sitekey from previous network monitoring: {extractor.sitekey_from_network}")
             sitekey = extractor.sitekey_from_network
-            turnstile_params = existing_params  # Will be None, but that's OK
-            existing_params = True  # Mark as found to skip network setup
+            # Don't set turnstile_params yet - we'll try to capture it via interceptor below
+            # Don't set existing_params = True - we still need to inject interceptor for turnstile_params
+            logger.debug("⚠️ Sitekey found but turnstile_params missing - will inject interceptor to capture them")
         
-        # Only set up network monitoring if we don't have a valid sitekey already
-        if not existing_params:
+        # Only skip interceptor injection if we already have both sitekey AND turnstile_params
+        has_sitekey_and_params = existing_params and existing_params.get('sitekey') and existing_params.get('action')
+        
+        # Set up monitoring and inject interceptor if we don't have complete params
+        if not has_sitekey_and_params:
             logger.debug("No existing sitekey found, setting up network monitoring...")
             # Monitoring may already be set up (checked above), but ensure it's active
             if not extractor.monitoring_setup:
@@ -234,9 +244,23 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
             # Wait a bit more for turnstile to potentially render
             await page.wait_for_timeout(3000)
             
-            # Extract sitekey from network
-            sitekey = await extractor.get_sitekey(page, wait_time=10000)  # Increased wait time
-            turnstile_params = await page.evaluate("() => window.turnstileParams")
+            # Extract sitekey from network (only if we don't already have one)
+            if not sitekey:
+                sitekey = await extractor.get_sitekey(page, wait_time=10000)  # Increased wait time
+            
+            # Always check for turnstile_params after interceptor injection
+            # (This is critical - we need action, data, pagedata for 2captcha API)
+            captured_params = await page.evaluate("() => window.turnstileParams")
+            if captured_params:
+                turnstile_params = captured_params
+                logger.debug(f"✅ Captured turnstile_params: action={captured_params.get('action')}, has_data={bool(captured_params.get('cData'))}, has_pagedata={bool(captured_params.get('chlPageData'))}")
+            elif not turnstile_params:
+                # Check one more time after a longer wait (Turnstile might be slow to render)
+                await page.wait_for_timeout(5000)
+                captured_params = await page.evaluate("() => window.turnstileParams")
+                if captured_params:
+                    turnstile_params = captured_params
+                    logger.debug(f"✅ Captured turnstile_params after longer wait")
         
         # CRITICAL FIX: Fallback to known sitekey if extraction failed (same as get_bypassed_page)
         if not sitekey:

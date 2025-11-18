@@ -39,10 +39,20 @@ class CloudflareTurnstileExtractor:
     
     async def setup_network_monitoring(self, page: Page):
         """Set up network request monitoring to capture sitekey from network traffic"""
-        # Don't set up monitoring twice
-        if self.monitoring_setup:
-            logger.info("Network monitoring already set up, skipping...")
+        # Store which page this extractor is monitoring
+        # If we're setting up on a different page, we need to attach handlers to it
+        current_page_id = getattr(self, '_monitoring_page_id', None)
+        page_id = id(page)
+        
+        # If already set up on this exact page, skip
+        if self.monitoring_setup and current_page_id == page_id:
+            logger.debug("Network monitoring already set up on this page, skipping...")
             return
+        
+        # If monitoring was set up on a different page, we still need to attach to this page
+        # (handlers are page-specific in Playwright)
+        if self.monitoring_setup and current_page_id != page_id:
+            logger.debug(f"Network monitoring active on different page, attaching to new page {page_id}...")
         
         async def handle_request(request):
             """Capture all network requests"""
@@ -113,6 +123,7 @@ class CloudflareTurnstileExtractor:
         page.on("response", handle_response)
         
         self.monitoring_setup = True
+        self._monitoring_page_id = page_id
         logger.info("Network monitoring enabled")
     
     def _is_valid_turnstile_sitekey(self, sitekey: str) -> bool:
@@ -1036,6 +1047,10 @@ async def get_bypassed_page(
         
         extractor = CloudflareTurnstileExtractor()
         await extractor.setup_network_monitoring(page)
+        
+        # Store extractor instance on context for reuse across page navigations
+        # This ensures network monitoring captures requests even on subsequent pages
+        context._cloudflare_extractor = extractor
         
         await page.goto(target_url)
         await page.wait_for_load_state("domcontentloaded")

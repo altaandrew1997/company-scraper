@@ -12,6 +12,10 @@ from pathlib import Path
 from loguru import logger
 from playwright.async_api import Page, Browser, BrowserContext
 from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from cloudflareSolver import get_bypassed_page, solve_cloudflare_challenge, CloudflareTurnstileExtractor
 from cloudflare_utils import is_session_valid
@@ -124,8 +128,25 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
         parsed_url = urlparse(page.url)
         domain = parsed_url.netloc
         
-        # Set up extractor to get sitekey
-        extractor = CloudflareTurnstileExtractor()
+        # CRITICAL FIX: Reuse extractor instance from context (created in get_bypassed_page)
+        # This ensures network monitoring persists and captures requests across page navigations
+        extractor = getattr(context, '_cloudflare_extractor', None)
+        
+        if extractor is None:
+            # No extractor found on context, create new one and attach it
+            logger.debug("No existing extractor found on context, creating new one...")
+            extractor = CloudflareTurnstileExtractor()
+            await extractor.setup_network_monitoring(page)
+            context._cloudflare_extractor = extractor
+        else:
+            logger.debug(f"✅ Reusing existing extractor instance (has {len(extractor.captured_requests)} captured requests)")
+            # Ensure monitoring is set up on this page (handlers are page-specific)
+            if not extractor.monitoring_setup:
+                logger.debug("Setting up network monitoring on this page...")
+                await extractor.setup_network_monitoring(page)
+            else:
+                # Monitoring already set up - handlers persist across navigations on the same page
+                logger.debug("Network monitoring already active from previous setup")
         
         # FIRST: Check if sitekey was already captured in window.turnstileParams
         # (from initial get_bypassed_page call - don't reset it!)
@@ -140,10 +161,19 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
                 logger.debug(f"Existing turnstileParams found but invalid sitekey: {existing_sitekey}")
                 existing_params = None
         
+        # Check if sitekey was already captured in extractor from previous requests
+        if not existing_params and extractor.sitekey_from_network:
+            logger.info(f"✅ Using sitekey from previous network monitoring: {extractor.sitekey_from_network}")
+            sitekey = extractor.sitekey_from_network
+            turnstile_params = existing_params  # Will be None, but that's OK
+            existing_params = True  # Mark as found to skip network setup
+        
         # Only set up network monitoring if we don't have a valid sitekey already
         if not existing_params:
             logger.debug("No existing sitekey found, setting up network monitoring...")
-            await extractor.setup_network_monitoring(page)
+            # Monitoring may already be set up (checked above), but ensure it's active
+            if not extractor.monitoring_setup:
+                await extractor.setup_network_monitoring(page)
             
             # Inject turnstile interceptor (only reset if not already set)
             await page.evaluate("""
@@ -208,9 +238,12 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
             sitekey = await extractor.get_sitekey(page, wait_time=10000)  # Increased wait time
             turnstile_params = await page.evaluate("() => window.turnstileParams")
         
+        # CRITICAL FIX: Fallback to known sitekey if extraction failed (same as get_bypassed_page)
         if not sitekey:
-            logger.error("❌ Could not extract sitekey from Cloudflare challenge")
-            return False
+            logger.warning("⚠️ Network monitoring didn't capture sitekey")
+            logger.warning("⚠️ Using known sitekey for ecorp.sos.ga.gov domain as fallback")
+            sitekey = "0x4AAAAAAADnPIDROrmt1Wwj"
+            logger.info(f"✓ Fallback sitekey applied: {sitekey}")
         
         logger.info(f"🔧 Found sitekey: {sitekey}, solving challenge...")
         if turnstile_params:
@@ -285,6 +318,16 @@ async def search_business(
     await human_like_type(page, "#txtBusinessName", search_term)
     await human_delay(0.5, 1.5)  # Pause after typing (human reading)
     logger.info("✅ Search term entered")
+    
+    # CRITICAL: Ensure network monitoring is active BEFORE clicking search
+    # This ensures we capture sitekey immediately when challenge appears
+    extractor = getattr(page.context, '_cloudflare_extractor', None)
+    if extractor:
+        if not extractor.monitoring_setup:
+            logger.debug("Setting up network monitoring before search click...")
+            await extractor.setup_network_monitoring(page)
+        else:
+            logger.debug("✅ Network monitoring already active, ready to capture sitekey")
     
     # Simulate human behavior before clicking
     await simulate_human_behavior(page)
@@ -387,16 +430,23 @@ async def extract_detail_page_data(page: Page, control_number: str) -> Dict[str,
                                 : cells[3].textContent.trim();
                             
                             // Extract fields (only new ones, skip duplicates from table)
-                            if (label === 'NAICS Code' && value) data['NAICS Code'] = value;
-                            if (label === 'NAICS Sub Code' && value) data['NAICS Sub Code'] = value;
+                            // NAICS fields - use new schema
+                            if (label === 'NAICS Code' && value) {
+                                data['naics_code'] = value;
+                                data['naics_classification_method'] = 'website';
+                            }
+                            if (label === 'NAICS Sub Code' && value) data['naics_sub_code'] = value;
                             if (label === 'Date of Formation / Registration Date' && value) data['Date of Formation'] = value;
                             if (label === 'State of Formation' && value) data['State of Formation'] = value;
                             if (label === 'Last Annual Registration Year' && value2) data['Last Annual Registration Year'] = value2;
                             if (label === 'Dissolved Date' && value) data['Dissolved Date'] = value;
                             
                             // Check second column
-                            if (label2 === 'NAICS Code' && value2) data['NAICS Code'] = value2;
-                            if (label2 === 'NAICS Sub Code' && value2) data['NAICS Sub Code'] = value2;
+                            if (label2 === 'NAICS Code' && value2) {
+                                data['naics_code'] = value2;
+                                data['naics_classification_method'] = 'website';
+                            }
+                            if (label2 === 'NAICS Sub Code' && value2) data['naics_sub_code'] = value2;
                             if (label2 === 'Date of Formation / Registration Date' && value2) data['Date of Formation'] = value2;
                             if (label2 === 'State of Formation' && value2) data['State of Formation'] = value2;
                             if (label2 === 'Last Annual Registration Year' && value2) data['Last Annual Registration Year'] = value2;
@@ -863,8 +913,17 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
     
     # Add new columns if they don't exist
     new_columns = [
+        # New NAICS schema
+        'naics_code',  # Primary NAICS Code (from website or Gemini)
+        'naics_code_numeric',  # 6-digit numeric code (from Gemini)
+        'naics_title',  # NAICS Title/Description
+        'naics_sub_code',  # NAICS Sub Code (specific category)
+        'naics_classification_method',  # Source: "website" or "gemini_ai"
+        'naics_confidence_score',  # Confidence score (0-1) if from Gemini
+        # Legacy fields for backward compatibility (will be mapped)
         'NAICS Code',
         'NAICS Sub Code',
+        # Other fields
         'Date of Formation',
         'State of Formation',
         'Last Annual Registration Year',
@@ -931,6 +990,29 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
             detail_data = await extract_detail_page_data(page, control_number)
             
             if detail_data:
+                # Map legacy fields to new NAICS schema if needed
+                import re
+                # If we have legacy 'NAICS Code' field, map it to new schema
+                if 'NAICS Code' in detail_data and detail_data['NAICS Code']:
+                    naics_code_value = detail_data['NAICS Code']
+                    # Check if it's numeric (2-6 digits) or text (description)
+                    if re.match(r'^\d{2,6}$', str(naics_code_value).strip()):
+                        # It's a numeric code
+                        df.at[idx, 'naics_code_numeric'] = naics_code_value.strip()
+                        df.at[idx, 'naics_code'] = naics_code_value.strip()
+                    else:
+                        # It's text/title from website
+                        df.at[idx, 'naics_title'] = naics_code_value.strip()
+                        df.at[idx, 'naics_code'] = naics_code_value.strip()
+                    
+                    # Set classification method to website
+                    if 'naics_classification_method' not in detail_data:
+                        detail_data['naics_classification_method'] = 'website'
+                
+                # Map legacy 'NAICS Sub Code' to new schema
+                if 'NAICS Sub Code' in detail_data and detail_data['NAICS Sub Code']:
+                    detail_data['naics_sub_code'] = detail_data['NAICS Sub Code']
+                
                 # Update DataFrame row with new data
                 for key, value in detail_data.items():
                     if key in df.columns:
@@ -1029,6 +1111,16 @@ async def main(excel_file_path: Optional[str] = None, detail_only: bool = False)
     """
     # Set up logging to file
     log_path = setup_logging()
+    
+    # Verify 2captcha API key is loaded
+    import os
+    twocaptcha_key = os.getenv('TWOCAPTCHA_API_KEY')
+    if twocaptcha_key:
+        logger.info(f"✅ 2captcha API key loaded: {twocaptcha_key[:10]}...")
+    else:
+        logger.warning("⚠️ TWOCAPTCHA_API_KEY not found in environment variables!")
+        logger.warning("⚠️ Set it in .env file or export as environment variable")
+        logger.warning("⚠️ Cloudflare challenges will not be solved without 2captcha API key")
     
     search_term = "landscap"
     

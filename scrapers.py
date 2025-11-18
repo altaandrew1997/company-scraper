@@ -6,16 +6,29 @@ Scrapes business data from Georgia Secretary of State website
 import asyncio
 import random
 import pandas as pd
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime
 from pathlib import Path
 from loguru import logger
 from playwright.async_api import Page, Browser, BrowserContext
 from urllib.parse import urlparse
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 from cloudflareSolver import get_bypassed_page, solve_cloudflare_challenge, CloudflareTurnstileExtractor
 from cloudflare_utils import is_session_valid
 from naics_classifier_ai import enrich_naics_codes_ai as enrich_naics_codes
+from google_scraper import (
+    search_google_for_website,
+    search_google_for_linkedin,
+    search_google_for_facebook,
+    get_google_business_profile,
+    setup_google_search_context,
+    human_delay as google_human_delay
+)
+from contact_extractor import ContactExtractor
 
 
 def setup_logging(log_filename: str = None):
@@ -124,8 +137,29 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
         parsed_url = urlparse(page.url)
         domain = parsed_url.netloc
         
-        # Set up extractor to get sitekey
-        extractor = CloudflareTurnstileExtractor()
+        # CRITICAL FIX: Reuse extractor instance from context (created in get_bypassed_page)
+        # This ensures network monitoring persists and captures requests across page navigations
+        extractor = getattr(context, '_cloudflare_extractor', None)
+        
+        if extractor is None:
+            # No extractor found on context, create new one and attach it
+            logger.debug("No existing extractor found on context, creating new one...")
+            extractor = CloudflareTurnstileExtractor()
+            await extractor.setup_network_monitoring(page)
+            context._cloudflare_extractor = extractor
+        else:
+            logger.debug(f"✅ Reusing existing extractor instance (has {len(extractor.captured_requests)} captured requests)")
+            # Ensure monitoring is set up on this page (handlers are page-specific)
+            if not extractor.monitoring_setup:
+                logger.debug("Setting up network monitoring on this page...")
+                await extractor.setup_network_monitoring(page)
+            else:
+                # Monitoring already set up - handlers persist across navigations on the same page
+                logger.debug("Network monitoring already active from previous setup")
+        
+        # Initialize variables
+        sitekey = None
+        turnstile_params = None
         
         # FIRST: Check if sitekey was already captured in window.turnstileParams
         # (from initial get_bypassed_page call - don't reset it!)
@@ -140,10 +174,25 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
                 logger.debug(f"Existing turnstileParams found but invalid sitekey: {existing_sitekey}")
                 existing_params = None
         
-        # Only set up network monitoring if we don't have a valid sitekey already
-        if not existing_params:
+        # Check if sitekey was already captured in extractor from previous requests
+        # IMPORTANT: Even if we have sitekey from network, we still need turnstile_params (action, data, pagedata)
+        # for 2captcha API, so we'll inject the interceptor below
+        if not existing_params and extractor.sitekey_from_network:
+            logger.info(f"✅ Using sitekey from previous network monitoring: {extractor.sitekey_from_network}")
+            sitekey = extractor.sitekey_from_network
+            # Don't set turnstile_params yet - we'll try to capture it via interceptor below
+            # Don't set existing_params = True - we still need to inject interceptor for turnstile_params
+            logger.debug("⚠️ Sitekey found but turnstile_params missing - will inject interceptor to capture them")
+        
+        # Only skip interceptor injection if we already have both sitekey AND turnstile_params
+        has_sitekey_and_params = existing_params and existing_params.get('sitekey') and existing_params.get('action')
+        
+        # Set up monitoring and inject interceptor if we don't have complete params
+        if not has_sitekey_and_params:
             logger.debug("No existing sitekey found, setting up network monitoring...")
-            await extractor.setup_network_monitoring(page)
+            # Monitoring may already be set up (checked above), but ensure it's active
+            if not extractor.monitoring_setup:
+                await extractor.setup_network_monitoring(page)
             
             # Inject turnstile interceptor (only reset if not already set)
             await page.evaluate("""
@@ -204,13 +253,30 @@ async def check_and_solve_cloudflare(page: Page, context: BrowserContext) -> boo
             # Wait a bit more for turnstile to potentially render
             await page.wait_for_timeout(3000)
             
-            # Extract sitekey from network
-            sitekey = await extractor.get_sitekey(page, wait_time=10000)  # Increased wait time
-            turnstile_params = await page.evaluate("() => window.turnstileParams")
+            # Extract sitekey from network (only if we don't already have one)
+            if not sitekey:
+                sitekey = await extractor.get_sitekey(page, wait_time=10000)  # Increased wait time
+            
+            # Always check for turnstile_params after interceptor injection
+            # (This is critical - we need action, data, pagedata for 2captcha API)
+            captured_params = await page.evaluate("() => window.turnstileParams")
+            if captured_params:
+                turnstile_params = captured_params
+                logger.debug(f"✅ Captured turnstile_params: action={captured_params.get('action')}, has_data={bool(captured_params.get('cData'))}, has_pagedata={bool(captured_params.get('chlPageData'))}")
+            elif not turnstile_params:
+                # Check one more time after a longer wait (Turnstile might be slow to render)
+                await page.wait_for_timeout(5000)
+                captured_params = await page.evaluate("() => window.turnstileParams")
+                if captured_params:
+                    turnstile_params = captured_params
+                    logger.debug(f"✅ Captured turnstile_params after longer wait")
         
+        # CRITICAL FIX: Fallback to known sitekey if extraction failed (same as get_bypassed_page)
         if not sitekey:
-            logger.error("❌ Could not extract sitekey from Cloudflare challenge")
-            return False
+            logger.warning("⚠️ Network monitoring didn't capture sitekey")
+            logger.warning("⚠️ Using known sitekey for ecorp.sos.ga.gov domain as fallback")
+            sitekey = "0x4AAAAAAADnPIDROrmt1Wwj"
+            logger.info(f"✓ Fallback sitekey applied: {sitekey}")
         
         logger.info(f"🔧 Found sitekey: {sitekey}, solving challenge...")
         if turnstile_params:
@@ -286,6 +352,16 @@ async def search_business(
     await human_delay(0.5, 1.5)  # Pause after typing (human reading)
     logger.info("✅ Search term entered")
     
+    # CRITICAL: Ensure network monitoring is active BEFORE clicking search
+    # This ensures we capture sitekey immediately when challenge appears
+    extractor = getattr(page.context, '_cloudflare_extractor', None)
+    if extractor:
+        if not extractor.monitoring_setup:
+            logger.debug("Setting up network monitoring before search click...")
+            await extractor.setup_network_monitoring(page)
+        else:
+            logger.debug("✅ Network monitoring already active, ready to capture sitekey")
+    
     # Simulate human behavior before clicking
     await simulate_human_behavior(page)
     await human_delay(0.3, 0.8)
@@ -330,6 +406,203 @@ async def search_business(
         # Continue anyway - results might still be loading
     
     return page
+
+
+def extract_city_state_from_address(address: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract city and state from Principal Office Address
+    
+    Args:
+        address: Address string (e.g., "1754 Bouldercrest Rd SE, Atlanta, GA 30316")
+        
+    Returns:
+        Tuple of (city, state) or (None, None) if not found
+    """
+    if not address:
+        return None, None
+    
+    try:
+
+        import re
+        
+        # Pattern 1: "City, ST ZIP" or "City, State ZIP"
+        pattern1 = r',\s*([A-Za-z\s]+?),\s*([A-Z]{2})(?:\s+\d{5})?$'
+        match = re.search(pattern1, address)
+        if match:
+            city = match.group(1).strip()
+            state = match.group(2).strip()
+            return city, state
+        
+        # Pattern 2: Last two words before ZIP (if ZIP exists)
+        pattern2 = r'([A-Za-z\s]+?),\s*([A-Z]{2})\s+\d{5}'
+        match = re.search(pattern2, address)
+        if match:
+            city = match.group(1).strip()
+            state = match.group(2).strip()
+            return city, state
+        
+        # Pattern 3: Split by comma and check last parts
+        parts = [p.strip() for p in address.split(',')]
+        if len(parts) >= 2:
+            # Last part might be "ST ZIP" or "State ZIP"
+            last_part = parts[-1]
+            state_match = re.search(r'\b([A-Z]{2})\b', last_part)
+            if state_match:
+                state = state_match.group(1)
+                # City is second-to-last part
+                if len(parts) >= 2:
+                    city = parts[-2]
+                    return city, state
+        
+        # Pattern 4: If no ZIP, try last comma-separated part as state
+        if ',' in address:
+            parts = [p.strip() for p in address.split(',')]
+            if len(parts) >= 2:
+                last_part = parts[-1]
+                # Check if last part is a 2-letter state code
+                if re.match(r'^[A-Z]{2}$', last_part):
+                    state = last_part
+                    city = parts[-2] if len(parts) >= 2 else None
+                    return city, state
+        
+        return None, None
+        
+    except Exception as e:
+        logger.debug(f"Error extracting city/state from address '{address}': {str(e)}")
+        return None, None
+
+
+async def enrich_contact_info(
+    business_name: str,
+    page: Page,
+    city: Optional[str] = None,
+    state: Optional[str] = None,
+    google_page: Optional[Page] = None
+) -> Dict[str, any]:
+    """
+    Enrich business data with contact information using Google search
+    
+    Args:
+        business_name: Name of the business
+        page: Playwright page object (current page - might be Georgia SOS)
+        city: Optional city name
+        state: Optional state name (default: 'GA')
+        google_page: Optional separate page for Google searches (if None, uses page)
+        
+    Returns:
+        Dictionary with contact information:
+        {
+            'Website': 'https://...',
+            'Email': 'email@domain.com',
+            'LinkedIn': 'https://linkedin.com/company/...',
+            'Facebook': 'https://facebook.com/...',
+            'Google_Business_Phone': '(404) 621-5252',
+            'Google_Business_Address': '1754 Bouldercrest Rd SE...',
+            'Google_Business_Rating': 4.5,
+            'Google_Business_Website': 'https://...',
+        }
+    """
+    result = {
+        'Website': None,
+        'Email': None,
+        'LinkedIn': None,
+        'Facebook': None,
+        'Google_Business_Phone': None,
+        'Google_Business_Address': None,
+        'Google_Business_Rating': None,
+        'Google_Business_Website': None,
+    }
+    
+    # Use separate Google page if provided, otherwise use current page
+    search_page = google_page if google_page else page
+    
+    try:
+        # Default state to GA if not provided
+        if not state:
+            state = 'GA'
+        
+        logger.info(f"   🔍 Enriching contact info via Google search...")
+        
+        # Step 1: Search for website
+        try:
+            website = await search_google_for_website(business_name, search_page, city, state)
+            if website:
+                result['Website'] = website
+                logger.info(f"   ✅ Found website: {website}")
+            else:
+                logger.debug(f"   ⚠️ No website found")
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error searching for website: {str(e)}")
+        
+        # Delay between searches
+        await google_human_delay(3.0, 5.0)
+        
+        # Step 2: Search for LinkedIn
+        try:
+            linkedin = await search_google_for_linkedin(business_name, search_page)
+            if linkedin:
+                result['LinkedIn'] = linkedin
+                logger.info(f"   ✅ Found LinkedIn: {linkedin}")
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error searching for LinkedIn: {str(e)}")
+        
+        # Delay between searches
+        await google_human_delay(3.0, 5.0)
+        
+        # Step 3: Search for Facebook
+        try:
+            facebook = await search_google_for_facebook(business_name, search_page)
+            if facebook:
+                result['Facebook'] = facebook
+                logger.info(f"   ✅ Found Facebook: {facebook}")
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error searching for Facebook: {str(e)}")
+        
+        # Delay between searches
+        await google_human_delay(3.0, 5.0)
+        
+        # Step 4: Get Google Business Profile
+        try:
+            profile = await get_google_business_profile(business_name, search_page, city, state)
+            if profile:
+                result['Google_Business_Phone'] = profile.get('phone')
+                result['Google_Business_Address'] = profile.get('address')
+                result['Google_Business_Rating'] = profile.get('rating')
+                google_website = profile.get('website')
+                if google_website and not result['Website']:
+                    # Use Google Business Profile website if we didn't find one via search
+                    result['Website'] = google_website
+                result['Google_Business_Website'] = google_website
+                logger.info(f"   ✅ Found Google Business Profile")
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error getting Google Business Profile: {str(e)}")
+        
+        # Step 5: Extract email from website if found
+        if result['Website']:
+            try:
+                extractor = ContactExtractor()
+                contact_data = await extractor.extract_from_page(search_page, result['Website'])
+                
+                if contact_data and contact_data.get('emails'):
+                    # Get primary email (first in prioritized list)
+                    result['Email'] = contact_data['emails'][0] if contact_data['emails'] else None
+                    if result['Email']:
+                        logger.info(f"   ✅ Extracted email: {result['Email']}")
+            except Exception as e:
+                logger.debug(f"   ⚠️ Error extracting email from website: {str(e)}")
+        
+        # Log summary
+        found_items = [k for k, v in result.items() if v]
+        if found_items:
+            logger.info(f"   ✅ Contact enrichment complete: {len(found_items)} items found")
+        else:
+            logger.debug(f"   ⚠️ No contact info found")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"   ❌ Error enriching contact info: {str(e)}")
+        return result
 
 
 async def extract_detail_page_data(page: Page, control_number: str) -> Dict[str, str]:
@@ -387,16 +660,23 @@ async def extract_detail_page_data(page: Page, control_number: str) -> Dict[str,
                                 : cells[3].textContent.trim();
                             
                             // Extract fields (only new ones, skip duplicates from table)
-                            if (label === 'NAICS Code' && value) data['NAICS Code'] = value;
-                            if (label === 'NAICS Sub Code' && value) data['NAICS Sub Code'] = value;
+                            // NAICS fields - use new schema
+                            if (label === 'NAICS Code' && value) {
+                                data['naics_code'] = value;
+                                data['naics_classification_method'] = 'website';
+                            }
+                            if (label === 'NAICS Sub Code' && value) data['naics_sub_code'] = value;
                             if (label === 'Date of Formation / Registration Date' && value) data['Date of Formation'] = value;
                             if (label === 'State of Formation' && value) data['State of Formation'] = value;
                             if (label === 'Last Annual Registration Year' && value2) data['Last Annual Registration Year'] = value2;
                             if (label === 'Dissolved Date' && value) data['Dissolved Date'] = value;
                             
                             // Check second column
-                            if (label2 === 'NAICS Code' && value2) data['NAICS Code'] = value2;
-                            if (label2 === 'NAICS Sub Code' && value2) data['NAICS Sub Code'] = value2;
+                            if (label2 === 'NAICS Code' && value2) {
+                                data['naics_code'] = value2;
+                                data['naics_classification_method'] = 'website';
+                            }
+                            if (label2 === 'NAICS Sub Code' && value2) data['naics_sub_code'] = value2;
                             if (label2 === 'Date of Formation / Registration Date' && value2) data['Date of Formation'] = value2;
                             if (label2 === 'State of Formation' && value2) data['State of Formation'] = value2;
                             if (label2 === 'Last Annual Registration Year' && value2) data['Last Annual Registration Year'] = value2;
@@ -844,7 +1124,13 @@ async def scrape_all_pages(page: Page, max_pages: Optional[int] = None) -> List[
     return all_data
 
 
-async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every: int = 100, output_file: Optional[str] = None) -> pd.DataFrame:
+async def enrich_business_data(
+    page: Page, 
+    df: pd.DataFrame, 
+    save_progress_every: int = 100, 
+    output_file: Optional[str] = None,
+    enrich_contact_info: bool = True
+) -> pd.DataFrame:
     """
     Enrich existing business data by visiting each detail page
     
@@ -853,6 +1139,7 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
         df: DataFrame with existing business data (must have 'Business Link' and 'Control Number' columns)
         save_progress_every: Save progress every N records
         output_file: Path to Excel file for incremental saves
+        enrich_contact_info: Whether to enrich with contact info via Google search (default: True)
         
     Returns:
         Enriched DataFrame with additional detail page data
@@ -863,8 +1150,17 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
     
     # Add new columns if they don't exist
     new_columns = [
+        # New NAICS schema
+        'naics_code',  # Primary NAICS Code (from website or Gemini)
+        'naics_code_numeric',  # 6-digit numeric code (from Gemini)
+        'naics_title',  # NAICS Title/Description
+        'naics_sub_code',  # NAICS Sub Code (specific category)
+        'naics_classification_method',  # Source: "website" or "gemini_ai"
+        'naics_confidence_score',  # Confidence score (0-1) if from Gemini
+        # Legacy fields for backward compatibility (will be mapped)
         'NAICS Code',
         'NAICS Sub Code',
+        # Other fields
         'Date of Formation',
         'State of Formation',
         'Last Annual Registration Year',
@@ -873,7 +1169,16 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
         'Registered Agent County',
         'Officers',  # JSON string of officers array
         'Officers_Formatted',  # Human-readable format
-        'Officer_Count'  # Number of officers
+        'Officer_Count',  # Number of officers
+        # Contact information from Google search
+        'Website',
+        'Email',
+        'LinkedIn',
+        'Facebook',
+        'Google_Business_Phone',
+        'Google_Business_Address',
+        'Google_Business_Rating',
+        'Google_Business_Website'
     ]
     
     for col in new_columns:
@@ -931,6 +1236,29 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
             detail_data = await extract_detail_page_data(page, control_number)
             
             if detail_data:
+                # Map legacy fields to new NAICS schema if needed
+                import re
+                # If we have legacy 'NAICS Code' field, map it to new schema
+                if 'NAICS Code' in detail_data and detail_data['NAICS Code']:
+                    naics_code_value = detail_data['NAICS Code']
+                    # Check if it's numeric (2-6 digits) or text (description)
+                    if re.match(r'^\d{2,6}$', str(naics_code_value).strip()):
+                        # It's a numeric code
+                        df.at[idx, 'naics_code_numeric'] = naics_code_value.strip()
+                        df.at[idx, 'naics_code'] = naics_code_value.strip()
+                    else:
+                        # It's text/title from website
+                        df.at[idx, 'naics_title'] = naics_code_value.strip()
+                        df.at[idx, 'naics_code'] = naics_code_value.strip()
+                    
+                    # Set classification method to website
+                    if 'naics_classification_method' not in detail_data:
+                        detail_data['naics_classification_method'] = 'website'
+                
+                # Map legacy 'NAICS Sub Code' to new schema
+                if 'NAICS Sub Code' in detail_data and detail_data['NAICS Sub Code']:
+                    detail_data['naics_sub_code'] = detail_data['NAICS Sub Code']
+                
                 # Update DataFrame row with new data
                 for key, value in detail_data.items():
                     if key in df.columns:
@@ -940,6 +1268,44 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
             else:
                 logger.warning(f"   ⚠️ No data extracted from detail page")
                 failed += 1
+            
+            # Step 2: Enrich with contact information via Google search (if enabled)
+            if enrich_contact_info:
+                try:
+                    # Extract city and state from Principal Office Address
+                    principal_address = row.get('Principal Office Address', '')
+                    city, state = extract_city_state_from_address(principal_address)
+                    
+                    # If we couldn't extract from address, try to get from existing row data
+                    if not city and 'City' in row and row.get('City'):
+                        city = row.get('City')
+                    if not state:
+                        state = 'GA'  # Default to Georgia
+                    
+                    # Enrich contact info via Google search
+                    contact_info = await enrich_contact_info(
+                        business_name=business_name,
+                        page=page,
+                        city=city,
+                        state=state,
+                        google_page=None  # Reuse same page (will navigate to Google)
+                    )
+                    
+                    # Update DataFrame with contact information
+                    for key, value in contact_info.items():
+                        if key in df.columns:
+                            df.at[idx, key] = value if value else ''
+                    
+                    # Log what was found
+                    found_contact_items = [k for k, v in contact_info.items() if v]
+                    if found_contact_items:
+                        logger.info(f"   ✅ Contact info enriched: {', '.join(found_contact_items)}")
+                    else:
+                        logger.debug(f"   ⚠️ No contact info found")
+                        
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Error enriching contact info: {str(e)}")
+                    # Continue - don't mark as failed, contact info is optional
             
             # Save progress periodically
             if processed % save_progress_every == 0:
@@ -1029,6 +1395,16 @@ async def main(excel_file_path: Optional[str] = None, detail_only: bool = False)
     """
     # Set up logging to file
     log_path = setup_logging()
+    
+    # Verify 2captcha API key is loaded
+    import os
+    twocaptcha_key = os.getenv('TWOCAPTCHA_API_KEY')
+    if twocaptcha_key:
+        logger.info(f"✅ 2captcha API key loaded: {twocaptcha_key[:10]}...")
+    else:
+        logger.warning("⚠️ TWOCAPTCHA_API_KEY not found in environment variables!")
+        logger.warning("⚠️ Set it in .env file or export as environment variable")
+        logger.warning("⚠️ Cloudflare challenges will not be solved without 2captcha API key")
     
     search_term = "landscap"
     

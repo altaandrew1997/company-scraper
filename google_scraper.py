@@ -1100,6 +1100,264 @@ async def search_google_for_executive_linkedin(
     return None
 
 
+async def get_google_business_profile(
+    business_name: str,
+    page: Page,
+    city: Optional[str] = None,
+    state: Optional[str] = None
+) -> Optional[Dict[str, any]]:
+    """
+    Search Google for business and extract Google Business Profile (Knowledge Panel) data
+    
+    This extracts the structured business information panel that appears on the right
+    side of Google search results, including phone, address, website, ratings, etc.
+    
+    Args:
+        business_name: Name of the business
+        city: Optional city name
+        state: Optional state name
+        page: Playwright page object
+        
+    Returns:
+        Dictionary with business profile data or None if not found:
+        {
+            'phone': '(404) 621-5252',
+            'address': '1754 Bouldercrest Rd SE, Atlanta, GA 30316',
+            'website': 'searchcarriers.com',
+            'rating': 4.5,
+            'review_count': 15,
+            'hours': {...},
+            'category': 'Logistics Company'
+        }
+    """
+    # Clean business name
+    clean_name = business_name
+    for suffix in [' LLC', ' L.L.C.', ' INC', ' INC.', ' CORP', ' CORPORATION', ' LTD', ' CO', ' CO.']:
+        clean_name = clean_name.replace(suffix, '')
+    clean_name = clean_name.strip().strip(',').strip()
+    
+    # Build search query
+    query_parts = [clean_name]
+    if city:
+        query_parts.append(city)
+    if state:
+        query_parts.append(state)
+    
+    query = ' '.join(query_parts)
+    
+    logger.info(f"🔍 Searching Google Business Profile for: '{query}'")
+    
+    try:
+        # Use existing search_google function but don't extract results yet
+        # We want to extract the Knowledge Panel directly
+        await page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
+        
+        # Human-like delay
+        await human_delay(1.5, 3.0)
+        
+        # Find and click search input
+        search_selectors = [
+            'textarea[name="q"]',
+            'input[name="q"]',
+            'textarea[aria-label*="Search"]',
+            'input[aria-label*="Search"]'
+        ]
+        
+        search_input = None
+        for selector in search_selectors:
+            try:
+                search_input = page.locator(selector).first
+                if await search_input.count() > 0:
+                    break
+            except:
+                continue
+        
+        if not search_input or await search_input.count() == 0:
+            logger.warning("⚠️ Could not find Google search input")
+            return None
+        
+        # Type and search
+        await search_input.click()
+        await human_delay(0.3, 0.6)
+        await page.keyboard.press("Control+A")
+        await human_delay(0.15, 0.3)
+        
+        # Type query with human-like delays
+        for char in query:
+            await page.keyboard.type(char, delay=random.uniform(100, 250))
+        
+        await human_delay(0.5, 1.0)
+        await page.keyboard.press("Enter")
+        
+        # Wait for results
+        await human_delay(1.0, 2.0)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20000)
+        except:
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        
+        await human_delay(2.0, 3.0)  # Wait for Knowledge Panel to load
+        
+        # Extract Knowledge Panel / Business Profile data
+        profile_data = await page.evaluate("""
+            () => {
+                const result = {
+                    phone: null,
+                    address: null,
+                    website: null,
+                    rating: null,
+                    review_count: null,
+                    hours: null,
+                    category: null
+                };
+                
+                // Method 1: Look for the Knowledge Panel (right side panel)
+                // This is the structured data panel that Google shows
+                
+                // Try to find the main Knowledge Panel container
+                const panel = document.querySelector('[data-attrid="kc:/location/location:address"]')?.closest('[data-ved]') ||
+                             document.querySelector('[data-attrid="kc:/organization/organization:address"]')?.closest('[data-ved]') ||
+                             document.querySelector('div[data-ved].kp-blk') ||
+                             document.querySelector('[jsname="fkbRMb"]') ||
+                             document.querySelector('[jsname="bVqjv"]');
+                
+                if (!panel) {
+                    // Try alternative selectors
+                    const panels = document.querySelectorAll('[data-ved]');
+                    for (const p of panels) {
+                        const text = p.innerText.toLowerCase();
+                        if (text.includes('address') || text.includes('phone') || text.includes('hours')) {
+                            // Likely the knowledge panel
+                            const panelText = p.innerText;
+                            
+                            // Extract phone (various formats)
+                            const phoneMatch = panelText.match(/[\\(]?\\d{3}[\\)]?[-.\\s]?\\d{3}[-.\\s]?\\d{4}/);
+                            if (phoneMatch) {
+                                result.phone = phoneMatch[0];
+                            }
+                            
+                            // Extract address (looks for street address patterns)
+                            const addressMatch = panelText.match(/\\d+\\s+[A-Za-z0-9\\s,]+(?:Avenue|Street|Road|Drive|Boulevard|Lane|Court|Way|Place|Circle|Georgia|GA|\\d{5})/i);
+                            if (addressMatch) {
+                                result.address = addressMatch[0];
+                            }
+                            break;
+                        }
+                    }
+                } else {
+                    // Extract from Knowledge Panel
+                    const panelText = panel.innerText;
+                    const panelHTML = panel.innerHTML;
+                    
+                    // Extract phone number
+                    const phonePatterns = [
+                        /[\\(]?\\d{3}[\\)]?[-.\\s]?\\d{3}[-.\\s]?\\d{4}/,
+                        /\\+1[-.\\s]?[\\(]?\\d{3}[\\)]?[-.\\s]?\\d{3}[-.\\s]?\\d{4}/
+                    ];
+                    
+                    for (const pattern of phonePatterns) {
+                        const match = panelText.match(pattern);
+                        if (match) {
+                            result.phone = match[0];
+                            break;
+                        }
+                    }
+                    
+                    // Extract address
+                    const addressPatterns = [
+                        /\\d+\\s+[A-Za-z0-9\\s,]+(?:Avenue|Street|Road|Drive|Boulevard|Lane|Court|Way|Place|Circle)[^\\n]*/i,
+                        /\\d+\\s+[A-Za-z0-9\\s,]+(?:Georgia|GA)[^\\n]*\\d{5}/i
+                    ];
+                    
+                    for (const pattern of addressPatterns) {
+                        const match = panelText.match(pattern);
+                        if (match) {
+                            result.address = match[0].trim();
+                            break;
+                        }
+                    }
+                    
+                    // Extract rating
+                    const ratingMatch = panelText.match(/(\\d+\\.\\d+)\\s*stars?/i) || 
+                                       panelText.match(/(\\d+\\.\\d+)\\s*★/);
+                    if (ratingMatch) {
+                        result.rating = parseFloat(ratingMatch[1]);
+                    }
+                    
+                    // Extract review count
+                    const reviewMatch = panelText.match(/(\\d+[,.]?\\d*)\\s*(?:reviews?|ratings?)/i);
+                    if (reviewMatch) {
+                        result.review_count = parseInt(reviewMatch[1].replace(/,/g, ''));
+                    }
+                    
+                    // Extract website
+                    const websiteLink = panel.querySelector('a[href^="http"]');
+                    if (websiteLink) {
+                        result.website = websiteLink.href;
+                    }
+                    
+                    // Extract category
+                    const categoryEl = panel.querySelector('[data-attrid="subtitle"]') ||
+                                      panel.querySelector('.YhemCb');
+                    if (categoryEl) {
+                        result.category = categoryEl.innerText.trim();
+                    }
+                }
+                
+                // Method 2: Look for structured data in JSON-LD
+                try {
+                    const jsonLd = document.querySelector('script[type="application/ld+json"]');
+                    if (jsonLd) {
+                        const data = JSON.parse(jsonLd.textContent);
+                        if (data['@type'] === 'LocalBusiness' || data['@type'] === 'Organization') {
+                            if (!result.phone && data.telephone) result.phone = data.telephone;
+                            if (!result.address && data.address) {
+                                const addr = data.address;
+                                result.address = `${addr.streetAddress || ''} ${addr.addressLocality || ''}, ${addr.addressRegion || ''} ${addr.postalCode || ''}`.trim();
+                            }
+                            if (!result.rating && data.aggregateRating) {
+                                result.rating = parseFloat(data.aggregateRating.ratingValue);
+                                result.review_count = parseInt(data.aggregateRating.reviewCount);
+                            }
+                            if (!result.website && data.url) result.website = data.url;
+                        }
+                    }
+                } catch (e) {
+                    // JSON-LD parsing failed, continue
+                }
+                
+                // Return only non-null values
+                const cleaned = {};
+                for (const key in result) {
+                    if (result[key] !== null) {
+                        cleaned[key] = result[key];
+                    }
+                }
+                
+                return Object.keys(cleaned).length > 0 ? cleaned : null;
+            }
+        """)
+        
+        if profile_data:
+            logger.info(f"✅ Found Google Business Profile:")
+            if profile_data.get('phone'):
+                logger.info(f"   Phone: {profile_data['phone']}")
+            if profile_data.get('address'):
+                logger.info(f"   Address: {profile_data['address']}")
+            if profile_data.get('website'):
+                logger.info(f"   Website: {profile_data['website']}")
+            if profile_data.get('rating'):
+                logger.info(f"   Rating: {profile_data['rating']} ({profile_data.get('review_count', 'N/A')} reviews)")
+            return profile_data
+        else:
+            logger.warning("⚠️ No Google Business Profile found")
+            return None
+            
+    except Exception as e:
+        logger.error(f"❌ Error getting Google Business Profile: {str(e)}")
+        return None
+
+
 async def search_google_batch(
     queries: List[str],
     page: Page,
@@ -1145,9 +1403,9 @@ if __name__ == "__main__":
         """Test Google scraper with a hardcoded business"""
         from playwright.async_api import async_playwright
         
-        # Hardcoded business data for testing
-        business_name = "4Seasons Logistics LLC"
-        city = "Atlanta"
+
+        business_name = "BIG BREEZE LANDSCAPING, LLC"
+        city = "Lawrenceville"
         state = "GA"
         
         logger.info("="*80)
@@ -1197,6 +1455,13 @@ if __name__ == "__main__":
             # Create page (stealth script already injected on context)
             page = await context.new_page()
             
+            # Initialize variables for summary
+            website = None
+            linkedin = None
+            facebook = None
+            business_profile = None
+            search_results = None
+            
             # Test 1: Search for website
             logger.info("\n📋 Test 1: Searching for website...")
             website = await search_google_for_website(business_name, page, city, state)
@@ -1227,13 +1492,29 @@ if __name__ == "__main__":
             else:
                 logger.warning("⚠️ No Facebook found")
             
-            # Test 4: Test general search
-            logger.info("\n📋 Test 4: General Google search...")
+            # Delay between searches
+            await human_delay(3.0, 5.0)
+            
+            # Test 4: Get Google Business Profile
+            logger.info("\n📋 Test 4: Getting Google Business Profile...")
+            business_profile = await get_google_business_profile(business_name, page, city, state)
+            if business_profile:
+                logger.info("✅ Found Google Business Profile:")
+                for key, value in business_profile.items():
+                    logger.info(f"   {key}: {value}")
+            else:
+                logger.warning("⚠️ No Google Business Profile found")
+            
+            # Delay between searches
+            await human_delay(3.0, 5.0)
+            
+            # Test 5: Test general search
+            logger.info("\n📋 Test 5: General Google search...")
             query = f'"{business_name}" "{city}" "{state}"'
-            results = await search_google(query, page, max_results=5)
-            if results:
-                logger.info(f"✅ Found {len(results)} results:")
-                for i, result in enumerate(results, 1):
+            search_results = await search_google(query, page, max_results=5)
+            if search_results:
+                logger.info(f"✅ Found {len(search_results)} results:")
+                for i, result in enumerate(search_results, 1):
                     logger.info(f"   {i}. {result.get('title', 'N/A')}")
                     logger.info(f"      URL: {result.get('url', 'N/A')}")
             
@@ -1245,11 +1526,19 @@ if __name__ == "__main__":
             logger.info(f"Website: {website if website else 'Not found'}")
             logger.info(f"LinkedIn: {linkedin if linkedin else 'Not found'}")
             logger.info(f"Facebook: {facebook if facebook else 'Not found'}")
-            logger.info(f"General Search Results: {len(results) if results else 0}")
+            if business_profile:
+                logger.info(f"Business Profile Phone: {business_profile.get('phone', 'Not found')}")
+                logger.info(f"Business Profile Address: {business_profile.get('address', 'Not found')}")
+            logger.info(f"General Search Results: {len(search_results) if search_results else 0}")
             logger.info("="*80)
             
-            # Keep browser open for inspection
-            input("\nPress Enter to close browser...")
+            # Keep browser open briefly for inspection (only if interactive)
+            try:
+                import sys
+                if sys.stdin.isatty():
+                    input("\nPress Enter to close browser...")
+            except:
+                pass
             
             # Close browser
             await browser.close()

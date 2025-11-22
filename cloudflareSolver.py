@@ -1079,7 +1079,44 @@ async def get_bypassed_page(
             }, 10);
         """)
         
-        await page.wait_for_timeout(10000)
+        # Wait for challenge to load and turnstile to render
+        await page.wait_for_timeout(5000)
+        
+        # Try to trigger turnstile render if it hasn't rendered yet (Windows compatibility fix)
+        await page.evaluate("""
+            () => {
+                // Try to find and render turnstile if it exists but hasn't rendered
+                if (window.turnstile && typeof window.turnstile.render === 'function') {
+                    const containers = document.querySelectorAll('[data-sitekey]');
+                    containers.forEach(container => {
+                        if (!container.querySelector('iframe')) {
+                            try {
+                                window.turnstile.render(container, {
+                                    sitekey: container.getAttribute('data-sitekey'),
+                                    callback: function(token) {
+                                        console.log('Turnstile rendered with token');
+                                    }
+                                });
+                            } catch(e) {
+                                console.log('Error rendering turnstile:', e);
+                            }
+                        }
+                    });
+                }
+            }
+        """)
+        
+        # Wait a bit more for turnstile to potentially render
+        await page.wait_for_timeout(3000)
+        
+        # Poll for turnstile_params (Windows may need more time)
+        turnstile_params = None
+        for attempt in range(5):  # Try up to 5 times
+            turnstile_params = await page.evaluate("() => window.turnstileParams")
+            if turnstile_params and turnstile_params.get('sitekey'):
+                logger.debug(f"✅ Captured turnstile_params on attempt {attempt + 1}")
+                break
+            await page.wait_for_timeout(2000)  # Wait 2 seconds between attempts
         
         # DEBUG: Check extractor state before calling get_sitekey
         logger.debug(f"DEBUG: extractor object id: {id(extractor)}")
@@ -1098,8 +1135,6 @@ async def get_bypassed_page(
         logger.debug(f"DEBUG: sitekey type: {type(sitekey)}")
         logger.debug(f"DEBUG: sitekey bool value: {bool(sitekey) if sitekey is not None else 'None'}")
         logger.debug(f"DEBUG: sitekey == '': {sitekey == '' if sitekey is not None else 'N/A'}")
-        
-        turnstile_params = await page.evaluate("() => window.turnstileParams")
         logger.debug(f"DEBUG: turnstile_params: {turnstile_params}")
         
         # CRITICAL FIX: Fallback to known sitekey if extraction failed

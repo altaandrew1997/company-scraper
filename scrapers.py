@@ -6,7 +6,7 @@ Scrapes business data from Georgia Secretary of State website
 import asyncio
 import random
 import pandas as pd
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime
 from pathlib import Path
 from loguru import logger
@@ -20,6 +20,15 @@ load_dotenv()
 from cloudflareSolver import get_bypassed_page, solve_cloudflare_challenge, CloudflareTurnstileExtractor
 from cloudflare_utils import is_session_valid
 from naics_classifier_ai import enrich_naics_codes_ai as enrich_naics_codes
+from google_scraper import (
+    search_google_for_website,
+    search_google_for_linkedin,
+    search_google_for_facebook,
+    get_google_business_profile,
+    setup_google_search_context,
+    human_delay as google_human_delay
+)
+from contact_extractor import ContactExtractor
 
 
 def setup_logging(log_filename: str = None):
@@ -397,6 +406,203 @@ async def search_business(
         # Continue anyway - results might still be loading
     
     return page
+
+
+def extract_city_state_from_address(address: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract city and state from Principal Office Address
+    
+    Args:
+        address: Address string (e.g., "1754 Bouldercrest Rd SE, Atlanta, GA 30316")
+        
+    Returns:
+        Tuple of (city, state) or (None, None) if not found
+    """
+    if not address:
+        return None, None
+    
+    try:
+
+        import re
+        
+        # Pattern 1: "City, ST ZIP" or "City, State ZIP"
+        pattern1 = r',\s*([A-Za-z\s]+?),\s*([A-Z]{2})(?:\s+\d{5})?$'
+        match = re.search(pattern1, address)
+        if match:
+            city = match.group(1).strip()
+            state = match.group(2).strip()
+            return city, state
+        
+        # Pattern 2: Last two words before ZIP (if ZIP exists)
+        pattern2 = r'([A-Za-z\s]+?),\s*([A-Z]{2})\s+\d{5}'
+        match = re.search(pattern2, address)
+        if match:
+            city = match.group(1).strip()
+            state = match.group(2).strip()
+            return city, state
+        
+        # Pattern 3: Split by comma and check last parts
+        parts = [p.strip() for p in address.split(',')]
+        if len(parts) >= 2:
+            # Last part might be "ST ZIP" or "State ZIP"
+            last_part = parts[-1]
+            state_match = re.search(r'\b([A-Z]{2})\b', last_part)
+            if state_match:
+                state = state_match.group(1)
+                # City is second-to-last part
+                if len(parts) >= 2:
+                    city = parts[-2]
+                    return city, state
+        
+        # Pattern 4: If no ZIP, try last comma-separated part as state
+        if ',' in address:
+            parts = [p.strip() for p in address.split(',')]
+            if len(parts) >= 2:
+                last_part = parts[-1]
+                # Check if last part is a 2-letter state code
+                if re.match(r'^[A-Z]{2}$', last_part):
+                    state = last_part
+                    city = parts[-2] if len(parts) >= 2 else None
+                    return city, state
+        
+        return None, None
+        
+    except Exception as e:
+        logger.debug(f"Error extracting city/state from address '{address}': {str(e)}")
+        return None, None
+
+
+async def enrich_contact_info(
+    business_name: str,
+    page: Page,
+    city: Optional[str] = None,
+    state: Optional[str] = None,
+    google_page: Optional[Page] = None
+) -> Dict[str, any]:
+    """
+    Enrich business data with contact information using Google search
+    
+    Args:
+        business_name: Name of the business
+        page: Playwright page object (current page - might be Georgia SOS)
+        city: Optional city name
+        state: Optional state name (default: 'GA')
+        google_page: Optional separate page for Google searches (if None, uses page)
+        
+    Returns:
+        Dictionary with contact information:
+        {
+            'Website': 'https://...',
+            'Email': 'email@domain.com',
+            'LinkedIn': 'https://linkedin.com/company/...',
+            'Facebook': 'https://facebook.com/...',
+            'Google_Business_Phone': '(404) 621-5252',
+            'Google_Business_Address': '1754 Bouldercrest Rd SE...',
+            'Google_Business_Rating': 4.5,
+            'Google_Business_Website': 'https://...',
+        }
+    """
+    result = {
+        'Website': None,
+        'Email': None,
+        'LinkedIn': None,
+        'Facebook': None,
+        'Google_Business_Phone': None,
+        'Google_Business_Address': None,
+        'Google_Business_Rating': None,
+        'Google_Business_Website': None,
+    }
+    
+    # Use separate Google page if provided, otherwise use current page
+    search_page = google_page if google_page else page
+    
+    try:
+        # Default state to GA if not provided
+        if not state:
+            state = 'GA'
+        
+        logger.info(f"   🔍 Enriching contact info via Google search...")
+        
+        # Step 1: Search for website
+        try:
+            website = await search_google_for_website(business_name, search_page, city, state)
+            if website:
+                result['Website'] = website
+                logger.info(f"   ✅ Found website: {website}")
+            else:
+                logger.debug(f"   ⚠️ No website found")
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error searching for website: {str(e)}")
+        
+        # Delay between searches
+        await google_human_delay(3.0, 5.0)
+        
+        # Step 2: Search for LinkedIn
+        try:
+            linkedin = await search_google_for_linkedin(business_name, search_page)
+            if linkedin:
+                result['LinkedIn'] = linkedin
+                logger.info(f"   ✅ Found LinkedIn: {linkedin}")
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error searching for LinkedIn: {str(e)}")
+        
+        # Delay between searches
+        await google_human_delay(3.0, 5.0)
+        
+        # Step 3: Search for Facebook
+        try:
+            facebook = await search_google_for_facebook(business_name, search_page)
+            if facebook:
+                result['Facebook'] = facebook
+                logger.info(f"   ✅ Found Facebook: {facebook}")
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error searching for Facebook: {str(e)}")
+        
+        # Delay between searches
+        await google_human_delay(3.0, 5.0)
+        
+        # Step 4: Get Google Business Profile
+        try:
+            profile = await get_google_business_profile(business_name, search_page, city, state)
+            if profile:
+                result['Google_Business_Phone'] = profile.get('phone')
+                result['Google_Business_Address'] = profile.get('address')
+                result['Google_Business_Rating'] = profile.get('rating')
+                google_website = profile.get('website')
+                if google_website and not result['Website']:
+                    # Use Google Business Profile website if we didn't find one via search
+                    result['Website'] = google_website
+                result['Google_Business_Website'] = google_website
+                logger.info(f"   ✅ Found Google Business Profile")
+        except Exception as e:
+            logger.debug(f"   ⚠️ Error getting Google Business Profile: {str(e)}")
+        
+        # Step 5: Extract email from website if found
+        if result['Website']:
+            try:
+                extractor = ContactExtractor()
+                contact_data = await extractor.extract_from_page(search_page, result['Website'])
+                
+                if contact_data and contact_data.get('emails'):
+                    # Get primary email (first in prioritized list)
+                    result['Email'] = contact_data['emails'][0] if contact_data['emails'] else None
+                    if result['Email']:
+                        logger.info(f"   ✅ Extracted email: {result['Email']}")
+            except Exception as e:
+                logger.debug(f"   ⚠️ Error extracting email from website: {str(e)}")
+        
+        # Log summary
+        found_items = [k for k, v in result.items() if v]
+        if found_items:
+            logger.info(f"   ✅ Contact enrichment complete: {len(found_items)} items found")
+        else:
+            logger.debug(f"   ⚠️ No contact info found")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"   ❌ Error enriching contact info: {str(e)}")
+        return result
 
 
 async def extract_detail_page_data(page: Page, control_number: str) -> Dict[str, str]:
@@ -918,7 +1124,13 @@ async def scrape_all_pages(page: Page, max_pages: Optional[int] = None) -> List[
     return all_data
 
 
-async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every: int = 100, output_file: Optional[str] = None) -> pd.DataFrame:
+async def enrich_business_data(
+    page: Page, 
+    df: pd.DataFrame, 
+    save_progress_every: int = 100, 
+    output_file: Optional[str] = None,
+    enrich_contact_info: bool = True
+) -> pd.DataFrame:
     """
     Enrich existing business data by visiting each detail page
     
@@ -927,6 +1139,7 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
         df: DataFrame with existing business data (must have 'Business Link' and 'Control Number' columns)
         save_progress_every: Save progress every N records
         output_file: Path to Excel file for incremental saves
+        enrich_contact_info: Whether to enrich with contact info via Google search (default: True)
         
     Returns:
         Enriched DataFrame with additional detail page data
@@ -956,7 +1169,16 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
         'Registered Agent County',
         'Officers',  # JSON string of officers array
         'Officers_Formatted',  # Human-readable format
-        'Officer_Count'  # Number of officers
+        'Officer_Count',  # Number of officers
+        # Contact information from Google search
+        'Website',
+        'Email',
+        'LinkedIn',
+        'Facebook',
+        'Google_Business_Phone',
+        'Google_Business_Address',
+        'Google_Business_Rating',
+        'Google_Business_Website'
     ]
     
     for col in new_columns:
@@ -1046,6 +1268,44 @@ async def enrich_business_data(page: Page, df: pd.DataFrame, save_progress_every
             else:
                 logger.warning(f"   ⚠️ No data extracted from detail page")
                 failed += 1
+            
+            # Step 2: Enrich with contact information via Google search (if enabled)
+            if enrich_contact_info:
+                try:
+                    # Extract city and state from Principal Office Address
+                    principal_address = row.get('Principal Office Address', '')
+                    city, state = extract_city_state_from_address(principal_address)
+                    
+                    # If we couldn't extract from address, try to get from existing row data
+                    if not city and 'City' in row and row.get('City'):
+                        city = row.get('City')
+                    if not state:
+                        state = 'GA'  # Default to Georgia
+                    
+                    # Enrich contact info via Google search
+                    contact_info = await enrich_contact_info(
+                        business_name=business_name,
+                        page=page,
+                        city=city,
+                        state=state,
+                        google_page=None  # Reuse same page (will navigate to Google)
+                    )
+                    
+                    # Update DataFrame with contact information
+                    for key, value in contact_info.items():
+                        if key in df.columns:
+                            df.at[idx, key] = value if value else ''
+                    
+                    # Log what was found
+                    found_contact_items = [k for k, v in contact_info.items() if v]
+                    if found_contact_items:
+                        logger.info(f"   ✅ Contact info enriched: {', '.join(found_contact_items)}")
+                    else:
+                        logger.debug(f"   ⚠️ No contact info found")
+                        
+                except Exception as e:
+                    logger.warning(f"   ⚠️ Error enriching contact info: {str(e)}")
+                    # Continue - don't mark as failed, contact info is optional
             
             # Save progress periodically
             if processed % save_progress_every == 0:

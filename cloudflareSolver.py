@@ -1052,37 +1052,96 @@ async def get_bypassed_page(
         # This ensures network monitoring captures requests even on subsequent pages
         context._cloudflare_extractor = extractor
         
-        await page.goto(target_url)
-        await page.wait_for_load_state("domcontentloaded")
-        
-        # Inject turnstile interceptor
-        await page.evaluate("""
+        # CRITICAL: Inject interceptor BEFORE navigation using add_init_script
+        # This ensures it's active before Turnstile loads, eliminating race conditions
+        await context.add_init_script("""
+            // Initialize turnstile params storage
             window.turnstileParams = null;
-            const interval = setInterval(() => {
-                if (window.turnstile) {
-                    clearInterval(interval);
+            
+            // Multiple strategies to ensure we catch turnstile.render()
+            const setupInterceptor = () => {
+                if (window.turnstile && typeof window.turnstile.render === 'function') {
+                    // Check if already intercepted (avoid double interception)
+                    if (window.turnstile.render.__intercepted) {
+                        return true;
+                    }
+                    
                     const originalRender = window.turnstile.render;
+                    
+                    // Wrap the render function
                     window.turnstile.render = function(container, options) {
+                        // Capture all parameters
                         window.turnstileParams = {
-                            sitekey: options.sitekey,
+                            sitekey: options.sitekey || container?.getAttribute('data-sitekey') || null,
                             action: options.action || null,
-                            cData: options.cData || null,
-                            chlPageData: options.chlPageData || null,
+                            cData: options.cData || options.data || null,
+                            chlPageData: options.chlPageData || options.pagedata || null,
                             callback: options.callback || null
                         };
+                        
+                        console.log('✅ Turnstile render intercepted with params:', window.turnstileParams);
+                        
+                        // Call original render
                         if (originalRender) {
                             return originalRender.call(this, container, options);
                         }
                         return 'foo';
                     };
+                    
+                    // Mark as intercepted
+                    window.turnstile.render.__intercepted = true;
+                    console.log('✅ Turnstile interceptor installed');
+                    return true;
                 }
-            }, 10);
+                return false;
+            };
+            
+            // Strategy 1: Try immediately (in case turnstile is already loaded)
+            if (!setupInterceptor()) {
+                // Strategy 2: Poll aggressively (4ms is browser minimum, works on all systems)
+                let pollCount = 0;
+                const maxPolls = 5000; // Safety limit: ~20 seconds max
+                const interval = setInterval(() => {
+                    pollCount++;
+                    if (setupInterceptor()) {
+                        clearInterval(interval);
+                    } else if (pollCount >= maxPolls) {
+                        // Safety: stop polling after max attempts
+                        clearInterval(interval);
+                        console.warn('Turnstile interceptor: Max polling attempts reached');
+                    }
+                }, 4); // 4ms is minimum browser throttle, works consistently on all platforms
+                
+                // Strategy 3: Also try on DOMContentLoaded (works on all browsers)
+                if (document.readyState === 'loading') {
+                    document.addEventListener('DOMContentLoaded', () => {
+                        setupInterceptor();
+                    });
+                } else if (document.readyState === 'interactive' || document.readyState === 'complete') {
+                    // Already loaded, try immediately
+                    setupInterceptor();
+                }
+                
+                // Strategy 4: Try on window load (backup for slow-loading pages)
+                if (document.readyState !== 'complete') {
+                    window.addEventListener('load', () => {
+                        setupInterceptor();
+                    });
+                } else {
+                    // Already loaded
+                    setupInterceptor();
+                }
+            }
         """)
+        
+        # Now navigate - interceptor is already in place
+        await page.goto(target_url)
+        await page.wait_for_load_state("domcontentloaded")
         
         # Wait for challenge to load and turnstile to render
         await page.wait_for_timeout(5000)
         
-        # Try to trigger turnstile render if it hasn't rendered yet (Windows compatibility fix)
+        # Try to trigger turnstile render if it hasn't rendered yet (backup)
         await page.evaluate("""
             () => {
                 // Try to find and render turnstile if it exists but hasn't rendered
@@ -1109,14 +1168,14 @@ async def get_bypassed_page(
         # Wait a bit more for turnstile to potentially render
         await page.wait_for_timeout(3000)
         
-        # Poll for turnstile_params (Windows may need more time)
+        # Poll for turnstile_params with more attempts
         turnstile_params = None
-        for attempt in range(5):  # Try up to 5 times
+        for attempt in range(10):  # Increased from 5 to 10
             turnstile_params = await page.evaluate("() => window.turnstileParams")
             if turnstile_params and turnstile_params.get('sitekey'):
                 logger.debug(f"✅ Captured turnstile_params on attempt {attempt + 1}")
                 break
-            await page.wait_for_timeout(2000)  # Wait 2 seconds between attempts
+            await page.wait_for_timeout(1000)  # Reduced from 2000ms to 1000ms for faster polling
         
         # DEBUG: Check extractor state before calling get_sitekey
         logger.debug(f"DEBUG: extractor object id: {id(extractor)}")

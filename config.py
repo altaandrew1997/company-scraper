@@ -67,6 +67,14 @@ ENRICHMENT_CONFIG = {
     "linkedin_enrichment_enabled": False  # Disabled initially
 }
 
+# Apollo enrichment filtering
+APOLLO_FILTERING = {
+    "min_score": 50,  # Minimum score (0-100) to qualify for Apollo enrichment
+    "require_website": True,  # Must have validated website (blocks if False)
+    "min_officers": 0,  # Minimum officers required (0 = not required)
+    "min_years_old": 0,  # Minimum years in business (0 = not required)
+}
+
 # Logging configuration
 LOGGING_CONFIG = {
     "level": "INFO",

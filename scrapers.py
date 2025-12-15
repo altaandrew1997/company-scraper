@@ -12,6 +12,7 @@ from pathlib import Path
 from loguru import logger
 from playwright.async_api import Page, Browser, BrowserContext
 from urllib.parse import urlparse
+import shutil
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -20,15 +21,17 @@ load_dotenv()
 from cloudflareSolver import get_bypassed_page, solve_cloudflare_challenge, CloudflareTurnstileExtractor
 from cloudflare_utils import is_session_valid
 from naics_classifier_ai import enrich_naics_codes_ai as enrich_naics_codes
-from google_scraper import (
+from google_scraper_selenium import (
     search_google_for_website,
     search_google_for_linkedin,
     search_google_for_facebook,
     get_google_business_profile,
-    setup_google_search_context,
+    create_undetected_driver,
     human_delay as google_human_delay
 )
+import undetected_chromedriver as uc
 from contact_extractor import ContactExtractor
+from website_validator import select_best_website, extract_domain, extract_domain_from_email
 
 
 def setup_logging(log_filename: str = None):
@@ -477,17 +480,17 @@ async def enrich_contact_info(
     page: Page,
     city: Optional[str] = None,
     state: Optional[str] = None,
-    google_page: Optional[Page] = None
+    google_driver: Optional[uc.Chrome] = None
 ) -> Dict[str, any]:
     """
-    Enrich business data with contact information using Google search
+    Enrich business data with contact information using Google search (Selenium)
     
     Args:
         business_name: Name of the business
-        page: Playwright page object (current page - might be Georgia SOS)
+        page: Playwright page object (for email extraction from website)
         city: Optional city name
         state: Optional state name (default: 'GA')
-        google_page: Optional separate page for Google searches (if None, uses page)
+        google_driver: Selenium WebDriver (undetected Chrome) for Google searches
         
     Returns:
         Dictionary with contact information:
@@ -513,19 +516,20 @@ async def enrich_contact_info(
         'Google_Business_Website': None,
     }
     
-    # Use separate Google page if provided, otherwise use current page
-    search_page = google_page if google_page else page
+    if not google_driver:
+        logger.warning("   ⚠️ No Google driver provided, skipping Google enrichment")
+        return result
     
     try:
         # Default state to GA if not provided
         if not state:
             state = 'GA'
         
-        logger.info(f"   🔍 Enriching contact info via Google search...")
+        logger.info(f"   🔍 Enriching contact info via Google search (Selenium)...")
         
-        # Step 1: Search for website
+        # Step 1: Search for website (run in thread pool since Selenium is sync)
         try:
-            website = await search_google_for_website(business_name, search_page, city, state)
+            website = await asyncio.to_thread(search_google_for_website, business_name, google_driver, city, state)
             if website:
                 result['Website'] = website
                 logger.info(f"   ✅ Found website: {website}")
@@ -535,11 +539,11 @@ async def enrich_contact_info(
             logger.debug(f"   ⚠️ Error searching for website: {str(e)}")
         
         # Delay between searches
-        await google_human_delay(3.0, 5.0)
+        await asyncio.sleep(random.uniform(3.0, 5.0))
         
         # Step 2: Search for LinkedIn
         try:
-            linkedin = await search_google_for_linkedin(business_name, search_page)
+            linkedin = await asyncio.to_thread(search_google_for_linkedin, business_name, google_driver)
             if linkedin:
                 result['LinkedIn'] = linkedin
                 logger.info(f"   ✅ Found LinkedIn: {linkedin}")
@@ -547,11 +551,11 @@ async def enrich_contact_info(
             logger.debug(f"   ⚠️ Error searching for LinkedIn: {str(e)}")
         
         # Delay between searches
-        await google_human_delay(3.0, 5.0)
+        await asyncio.sleep(random.uniform(3.0, 5.0))
         
         # Step 3: Search for Facebook
         try:
-            facebook = await search_google_for_facebook(business_name, search_page)
+            facebook = await asyncio.to_thread(search_google_for_facebook, business_name, google_driver)
             if facebook:
                 result['Facebook'] = facebook
                 logger.info(f"   ✅ Found Facebook: {facebook}")
@@ -559,40 +563,86 @@ async def enrich_contact_info(
             logger.debug(f"   ⚠️ Error searching for Facebook: {str(e)}")
         
         # Delay between searches
-        await google_human_delay(3.0, 5.0)
+        await asyncio.sleep(random.uniform(3.0, 5.0))
         
         # Step 4: Get Google Business Profile
+        google_website = None
         try:
-            profile = await get_google_business_profile(business_name, search_page, city, state)
+            profile = await asyncio.to_thread(get_google_business_profile, business_name, google_driver, city, state)
             if profile:
                 result['Google_Business_Phone'] = profile.get('phone')
                 result['Google_Business_Address'] = profile.get('address')
                 result['Google_Business_Rating'] = profile.get('rating')
                 google_website = profile.get('website')
-                if google_website and not result['Website']:
-                    # Use Google Business Profile website if we didn't find one via search
-                    result['Website'] = google_website
                 result['Google_Business_Website'] = google_website
                 logger.info(f"   ✅ Found Google Business Profile")
         except Exception as e:
             logger.debug(f"   ⚠️ Error getting Google Business Profile: {str(e)}")
         
-        # Step 5: Extract email from website if found
-        if result['Website']:
+        # Step 5: Extract email from website if found (still use Playwright for this)
+        email_domain = None
+        if result['Website'] and page:
             try:
                 extractor = ContactExtractor()
-                contact_data = await extractor.extract_from_page(search_page, result['Website'])
+                contact_data = await extractor.extract_from_page(page, result['Website'])
                 
                 if contact_data and contact_data.get('emails'):
                     # Get primary email (first in prioritized list)
                     result['Email'] = contact_data['emails'][0] if contact_data['emails'] else None
                     if result['Email']:
+                        email_domain = extract_domain_from_email(result['Email'])
                         logger.info(f"   ✅ Extracted email: {result['Email']}")
             except Exception as e:
                 logger.debug(f"   ⚠️ Error extracting email from website: {str(e)}")
         
+        # Step 6: Collect multiple website sources and validate
+        website_sources = []
+        
+        # Source 1: Google Business Profile (highest confidence)
+        if google_website:
+            website_sources.append({
+                'url': google_website,
+                'source': 'google_business'
+            })
+        
+        # Source 2: LinkedIn company page domain
+        if result.get('LinkedIn'):
+            linkedin_domain = extract_domain(result['LinkedIn'])
+            # LinkedIn company pages have format: linkedin.com/company/company-name
+            # We can't extract the actual company website from LinkedIn URL directly
+            # But we can use it as a validation signal
+        
+        # Source 3: Email domain (if email found)
+        if email_domain:
+            # Construct potential website from email domain
+            email_website = f"https://{email_domain}"
+            website_sources.append({
+                'url': email_website,
+                'source': 'email'
+            })
+        
+        # Source 4: Google search result
+        if result.get('Website'):
+            website_sources.append({
+                'url': result['Website'],
+                'source': 'google_search'
+            })
+        
+        # Select best validated website
+        if website_sources:
+            best_website = select_best_website(website_sources, business_name)
+            if best_website:
+                result['Website'] = best_website['url']
+                result['Website_Confidence'] = best_website['combined_confidence']
+                result['Website_Source'] = best_website['source']
+                result['Website_Validation_Reason'] = best_website['validation']['reason']
+                logger.info(f"   ✅ Validated website: {best_website['url']} (confidence: {best_website['combined_confidence']:.0%}, source: {best_website['source']})")
+            else:
+                # Keep original if validation fails
+                logger.warning(f"   ⚠️ Website validation failed, keeping original")
+        
         # Log summary
-        found_items = [k for k, v in result.items() if v]
+        found_items = [k for k, v in result.items() if v and k not in ['Website_Confidence', 'Website_Source', 'Website_Validation_Reason']]
         if found_items:
             logger.info(f"   ✅ Contact enrichment complete: {len(found_items)} items found")
         else:
@@ -660,12 +710,12 @@ async def extract_detail_page_data(page: Page, control_number: str) -> Dict[str,
                                 : cells[3].textContent.trim();
                             
                             // Extract fields (only new ones, skip duplicates from table)
-                            // NAICS fields - use new schema
+                            // NAICS fields - Georgia SOS website source
                             if (label === 'NAICS Code' && value) {
-                                data['naics_code'] = value;
-                                data['naics_classification_method'] = 'website';
+                                data['Georgia_SOS_NAICS'] = value;
+                                data['NAICS_Source'] = 'Georgia SOS Website';
                             }
-                            if (label === 'NAICS Sub Code' && value) data['naics_sub_code'] = value;
+                            if (label === 'NAICS Sub Code' && value) data['Georgia_SOS_NAICS_Sub'] = value;
                             if (label === 'Date of Formation / Registration Date' && value) data['Date of Formation'] = value;
                             if (label === 'State of Formation' && value) data['State of Formation'] = value;
                             if (label === 'Last Annual Registration Year' && value2) data['Last Annual Registration Year'] = value2;
@@ -673,10 +723,10 @@ async def extract_detail_page_data(page: Page, control_number: str) -> Dict[str,
                             
                             // Check second column
                             if (label2 === 'NAICS Code' && value2) {
-                                data['naics_code'] = value2;
-                                data['naics_classification_method'] = 'website';
+                                data['Georgia_SOS_NAICS'] = value2;
+                                data['NAICS_Source'] = 'Georgia SOS Website';
                             }
-                            if (label2 === 'NAICS Sub Code' && value2) data['naics_sub_code'] = value2;
+                            if (label2 === 'NAICS Sub Code' && value2) data['Georgia_SOS_NAICS_Sub'] = value2;
                             if (label2 === 'Date of Formation / Registration Date' && value2) data['Date of Formation'] = value2;
                             if (label2 === 'State of Formation' && value2) data['State of Formation'] = value2;
                             if (label2 === 'Last Annual Registration Year' && value2) data['Last Annual Registration Year'] = value2;
@@ -1061,13 +1111,14 @@ async def go_to_page(page: Page, page_number: int) -> bool:
         return False
 
 
-async def scrape_all_pages(page: Page, max_pages: Optional[int] = None) -> List[Dict[str, str]]:
+async def scrape_all_pages(page: Page, max_pages: Optional[int] = None, max_records: Optional[int] = None) -> List[Dict[str, str]]:
     """
     Scrape all pages of search results
     
     Args:
         page: Playwright page object with search results
         max_pages: Optional limit on number of pages to scrape (for testing)
+        max_records: Optional limit on number of records to scrape (stops when reached)
         
     Returns:
         List of all business records from all pages
@@ -1080,6 +1131,9 @@ async def scrape_all_pages(page: Page, max_pages: Optional[int] = None) -> List[
     if max_pages:
         total_pages = min(total_pages, max_pages)
         logger.info(f"⚠️ Limiting to {max_pages} pages for testing")
+    
+    if max_records:
+        logger.info(f"⚠️ Will stop after collecting {max_records} records")
     
     logger.info(f"📊 Starting to scrape {total_pages} pages...")
     
@@ -1097,11 +1151,17 @@ async def scrape_all_pages(page: Page, max_pages: Optional[int] = None) -> List[
         if page_data:
             all_data.extend(page_data)
             logger.info(f"✅ Added {len(page_data)} records (Total: {len(all_data)})")
+            
+            # Check if we've reached max_records limit
+            if max_records and len(all_data) >= max_records:
+                logger.info(f"⚠️ Reached limit of {max_records} records. Stopping.")
+                all_data = all_data[:max_records]  # Trim to exact limit
+                break
         else:
             logger.warning(f"⚠️ No data found on page {page_num}")
         
-        # Go to next page if not on last page
-        if page_num < total_pages:
+        # Go to next page if not on last page and haven't reached limit
+        if page_num < total_pages and (not max_records or len(all_data) < max_records):
             # Human pause before clicking next (like reviewing the page)
             await human_delay(1.0, 3.0)
             
@@ -1124,12 +1184,337 @@ async def scrape_all_pages(page: Page, max_pages: Optional[int] = None) -> List[
     return all_data
 
 
+async def extract_detail_pages_only(
+    page: Page, 
+    df: pd.DataFrame, 
+    save_progress_every: int = 100, 
+    output_file: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Extract detail page data ONLY (no Google enrichment)
+    This function completes ALL detail page scraping before moving to next step
+    
+    Args:
+        page: Playwright page object (same browser session)
+        df: DataFrame with existing business data (must have 'Business Link' and 'Control Number' columns)
+        save_progress_every: Save progress every N records
+        output_file: Path to Excel file for incremental saves
+        
+    Returns:
+        DataFrame with detail page data (no Google enrichment)
+    """
+    if df.empty:
+        logger.warning("No data to enrich")
+        return df
+    
+    # Add new columns if they don't exist (detail page fields only, no Google fields)
+    new_columns = [
+        # Georgia SOS Website NAICS data
+        'Georgia_SOS_NAICS',  # NAICS from Georgia SOS website (may be text description)
+        'Georgia_SOS_NAICS_Sub',  # NAICS Sub Code from website
+        'NAICS_Source',  # Source: "Georgia SOS Website" or "Gemini AI"
+        # Gemini AI enriched NAICS (uppercase)
+        'NAICS Code',  # 6-digit numeric code from Gemini AI
+        'NAICS Title',  # NAICS Title from Gemini AI
+        'NAICS Confidence',  # Confidence score from Gemini
+        'NAICS Classification Method',  # Method used: Gemini AI or keyword
+        # Other fields
+        'Date of Formation',
+        'State of Formation',
+        'Last Annual Registration Year',
+        'Dissolved Date',
+        'Registered Agent Physical Address',
+        'Registered Agent County',
+        'Officers',  # JSON string of officers array
+        'Officers_Formatted',  # Human-readable format
+        'Officer_Count',  # Number of officers
+    ]
+    
+    for col in new_columns:
+        if col not in df.columns:
+            df[col] = ''
+    
+    total_records = len(df)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🔍 Starting DETAIL PAGE extraction for {total_records} businesses")
+    logger.info(f"   (Google enrichment will be done separately)")
+    logger.info(f"{'='*60}")
+    
+    processed = 0
+    failed = 0
+    
+    # Store original URL to navigate back to results if needed
+    original_url = page.url
+    
+    for idx, row in df.iterrows():
+        processed += 1
+        
+        business_link = row.get('Business Link', '')
+        control_number = row.get('Control Number', '')
+        business_name = row.get('Business Name', '')
+        
+        if not business_link:
+            logger.warning(f"⚠️ Row {idx + 1}: No business link, skipping")
+            continue
+        
+        # Check if link is relative or absolute
+        if business_link.startswith('/'):
+            business_link = f"https://ecorp.sos.ga.gov{business_link}"
+        
+        logger.info(f"\n📄 [{processed}/{total_records}] Extracting detail page: {business_name[:50]}...")
+        logger.info(f"   Control Number: {control_number}")
+        logger.info(f"   URL: {business_link}")
+        
+        try:
+            # Human-like pause before navigating
+            await human_delay(0.5, 1.5)
+            
+            # Navigate to detail page
+            await page.goto(business_link, wait_until="domcontentloaded")
+            
+            # Check for Cloudflare challenge after navigation
+            await check_and_solve_cloudflare(page, page.context)
+            
+            # Human-like wait for page to render (humans don't process instantly)
+            await human_delay(1.0, 2.5)
+            
+            # Simulate reading the page
+            await simulate_human_behavior(page)
+            await human_delay(0.5, 1.5)
+            
+            # Extract detail page data
+            detail_data = await extract_detail_page_data(page, control_number)
+            
+            if detail_data:
+                # Map extracted NAICS data to DataFrame columns
+                import re
+                # If we have Georgia_SOS_NAICS field from website
+                if 'Georgia_SOS_NAICS' in detail_data and detail_data['Georgia_SOS_NAICS']:
+                    df.at[idx, 'Georgia_SOS_NAICS'] = detail_data['Georgia_SOS_NAICS']
+                    df.at[idx, 'NAICS_Source'] = 'Georgia SOS Website'
+                
+                # Map Georgia_SOS_NAICS_Sub
+                if 'Georgia_SOS_NAICS_Sub' in detail_data and detail_data['Georgia_SOS_NAICS_Sub']:
+                    df.at[idx, 'Georgia_SOS_NAICS_Sub'] = detail_data['Georgia_SOS_NAICS_Sub']
+                
+                # Update DataFrame row with new data
+                for key, value in detail_data.items():
+                    if key in df.columns:
+                        df.at[idx, key] = value
+                
+                logger.info(f"   ✅ Extracted {len(detail_data)} fields from detail page")
+            else:
+                logger.warning(f"   ⚠️ No data extracted from detail page")
+                failed += 1
+            
+            # Save progress periodically
+            if processed % save_progress_every == 0:
+                if output_file:
+                    df.to_excel(output_file, index=False, engine='openpyxl')
+                    logger.info(f"   💾 Progress saved: {processed}/{total_records} processed")
+            
+            # Variable delay between requests (more human-like)
+            base_delay = random.uniform(2.0, 4.0)  # 2-4 seconds base
+            await asyncio.sleep(base_delay)
+            
+            # Occasional longer pause (10% chance - like human taking break)
+            if random.random() < 0.1:
+                break_time = random.uniform(5.0, 15.0)
+                logger.info(f"   ⏸️  Taking a short break... ({break_time:.1f}s)")
+                await asyncio.sleep(break_time)
+            
+            # Very occasional long pause (1% chance - like human getting distracted)
+            elif random.random() < 0.01:
+                long_break = random.uniform(20.0, 60.0)
+                logger.info(f"   ⏸️  Taking a longer break... ({long_break:.1f}s)")
+                await asyncio.sleep(long_break)
+            
+        except Exception as e:
+            logger.error(f"   ❌ Error processing {business_link}: {str(e)}")
+            failed += 1
+            # Continue with next record
+            continue
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"✅ DETAIL PAGE extraction complete!")
+    logger.info(f"   Total processed: {processed}/{total_records}")
+    logger.info(f"   Successful: {processed - failed}")
+    logger.info(f"   Failed: {failed}")
+    logger.info(f"{'='*60}")
+    
+    return df
+
+
+async def enrich_google_data_only(
+    df: pd.DataFrame,
+    google_driver: uc.Chrome,
+    page: Optional[Page] = None,
+    save_progress_every: int = 50,
+    output_file: Optional[str] = None
+) -> pd.DataFrame:
+    """
+    Enrich DataFrame with Google data ONLY (no detail page extraction)
+    This function is called AFTER all detail pages have been scraped
+    
+    Args:
+        df: DataFrame with business data (already has detail page data)
+        google_driver: Selenium WebDriver (undetected Chrome) for Google searches
+        page: Optional Playwright page for email extraction from websites
+        save_progress_every: Save progress every N records
+        output_file: Path to Excel file for incremental saves
+        
+    Returns:
+        DataFrame enriched with Google contact information
+    """
+    if df.empty:
+        logger.warning("No data to enrich with Google")
+        return df
+    
+    # Add Google contact info columns if they don't exist
+    google_columns = [
+        'Website',
+        'Website_Confidence',
+        'Website_Source',
+        'Website_Validation_Reason',
+        'Email',
+        'LinkedIn',
+        'Facebook'
+        # Google Business Profile columns removed - using DuckDuckGo instead
+    ]
+    
+    for col in google_columns:
+        if col not in df.columns:
+            df[col] = ''
+    
+    total_records = len(df)
+    logger.info(f"\n{'='*60}")
+    logger.info(f"🔍 Starting GOOGLE enrichment for {total_records} businesses")
+    logger.info(f"{'='*60}")
+    
+    processed = 0
+    failed = 0
+    
+    # Internal driver reference that we can rotate
+    current_driver = google_driver
+    
+    for idx, row in df.iterrows():
+        processed += 1
+        
+        business_name = row.get('Business Name', '') or row.get('Entity Name', '')
+        
+        if not business_name:
+            logger.warning(f"⚠️ Row {idx + 1}: No business name, skipping")
+            continue
+        
+        logger.info(f"\n🔍 [{processed}/{total_records}] Google enrichment: {business_name[:50]}...")
+        
+        try:
+            # Extract city and state from Principal Office Address
+            principal_address = row.get('Principal Office Address', '')
+            city, state = extract_city_state_from_address(principal_address)
+            
+            # If we couldn't extract from address, try to get from existing row data
+            if not city and 'City' in row and row.get('City'):
+                city = row.get('City')
+            if not state:
+                state = 'GA'  # Default to Georgia
+            
+            # Enrich contact info via Google search (using Selenium driver)
+            # Use local current_driver which might be rotated
+            contact_info = await enrich_contact_info(
+                business_name=business_name,
+                page=page,  # Playwright page for email extraction
+                city=city,
+                state=state,
+                google_driver=current_driver  # Selenium driver for Google searches
+            )
+            
+            # SESSION ROTATION LOGIC
+            # Rotate after every 3 searches to avoid CAPTCHAs
+            if processed % 3 == 0:
+                logger.info("🔄 Rotating browser session (3 searches reached)...")
+                try:
+                    current_driver.quit()
+                    logger.debug("   Closed old driver")
+                except Exception as e:
+                    logger.debug(f"   Error closing driver: {e}")
+                
+                # Small human pause
+                await asyncio.sleep(2)
+                
+                # Clear user data
+                try:
+                    shutil.rmtree('/tmp/chrome_user_data', ignore_errors=True)
+                    logger.debug("   Cleared /tmp/chrome_user_data")
+                except Exception as e:
+                    logger.debug(f"   Error clearing user data: {e}")
+                
+                # Create NEW driver
+                logger.info("   🚀 Launching fresh browser...")
+                try:
+                    current_driver = await asyncio.to_thread(create_undetected_driver, headless=False)
+                    logger.info("   ✅ Fresh browser ready")
+                except Exception as e:
+                    logger.error(f"   ❌ Failed to create new driver: {e}")
+                    # Try one more time? Or just fail?
+                    # Let's try to proceed, but if it failed, next iteration will fail.
+                    # We should probably raise or break, but let's let the next try/catch handle it
+                    pass
+            
+            # Update DataFrame with contact information
+            for key, value in contact_info.items():
+                if key in df.columns:
+                    df.at[idx, key] = value if value else ''
+            
+            # Log what was found
+            found_contact_items = [k for k, v in contact_info.items() if v and k not in ['Website_Confidence', 'Website_Source', 'Website_Validation_Reason']]
+            if found_contact_items:
+                logger.info(f"   ✅ Contact info enriched: {', '.join(found_contact_items)}")
+            else:
+                logger.debug(f"   ⚠️ No contact info found")
+            
+            # Save progress periodically
+            if processed % save_progress_every == 0:
+                if output_file:
+                    df.to_excel(output_file, index=False, engine='openpyxl')
+                    logger.info(f"   💾 Progress saved: {processed}/{total_records} processed")
+            
+            # Additional delay between Google searches (rate limiting is handled in Selenium functions)
+            # But add extra delay here for safety
+            base_delay = random.uniform(2.0, 4.0)  # Additional 2-4 seconds between records
+            await asyncio.sleep(base_delay)
+            
+        except Exception as e:
+            logger.warning(f"   ⚠️ Error enriching Google data for {business_name}: {str(e)}")
+            failed += 1
+            # Continue with next record
+            continue
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"✅ GOOGLE enrichment complete!")
+    logger.info(f"   Total processed: {processed}/{total_records}")
+    logger.info(f"   Successful: {processed - failed}")
+    logger.info(f"   Failed: {failed}")
+    logger.info(f"{'='*60}")
+    
+    # Close the final driver instance
+    try:
+        if current_driver:
+            current_driver.quit()
+            logger.info("✅ Closed final Selenium driver")
+    except:
+        pass
+
+    return df
+
+
 async def enrich_business_data(
     page: Page, 
     df: pd.DataFrame, 
     save_progress_every: int = 100, 
     output_file: Optional[str] = None,
-    enrich_contact_info: bool = True
+    enrich_contact_info: bool = True,
+    google_page: Optional[Page] = None
 ) -> pd.DataFrame:
     """
     Enrich existing business data by visiting each detail page
@@ -1150,16 +1535,15 @@ async def enrich_business_data(
     
     # Add new columns if they don't exist
     new_columns = [
-        # New NAICS schema
-        'naics_code',  # Primary NAICS Code (from website or Gemini)
-        'naics_code_numeric',  # 6-digit numeric code (from Gemini)
-        'naics_title',  # NAICS Title/Description
-        'naics_sub_code',  # NAICS Sub Code (specific category)
-        'naics_classification_method',  # Source: "website" or "gemini_ai"
-        'naics_confidence_score',  # Confidence score (0-1) if from Gemini
-        # Legacy fields for backward compatibility (will be mapped)
-        'NAICS Code',
-        'NAICS Sub Code',
+        # Georgia SOS Website NAICS data
+        'Georgia_SOS_NAICS',  # NAICS from Georgia SOS website (may be text description)
+        'Georgia_SOS_NAICS_Sub',  # NAICS Sub Code from website
+        'NAICS_Source',  # Source: "Georgia SOS Website" or "Gemini AI"
+        # Gemini AI enriched NAICS (uppercase)
+        'NAICS Code',  # 6-digit numeric code from Gemini AI
+        'NAICS Title',  # NAICS Title from Gemini AI
+        'NAICS Confidence',  # Confidence score from Gemini
+        'NAICS Classification Method',  # Method used: Gemini AI or keyword
         # Other fields
         'Date of Formation',
         'State of Formation',
@@ -1170,15 +1554,15 @@ async def enrich_business_data(
         'Officers',  # JSON string of officers array
         'Officers_Formatted',  # Human-readable format
         'Officer_Count',  # Number of officers
-        # Contact information from Google search
+        # Contact information from DuckDuckGo search
         'Website',
+        'Website_Confidence',
+        'Website_Source',
+        'Website_Validation_Reason',
         'Email',
         'LinkedIn',
-        'Facebook',
-        'Google_Business_Phone',
-        'Google_Business_Address',
-        'Google_Business_Rating',
-        'Google_Business_Website'
+        'Facebook'
+        # Google Business Profile columns removed - using DuckDuckGo instead
     ]
     
     for col in new_columns:
@@ -1236,28 +1620,16 @@ async def enrich_business_data(
             detail_data = await extract_detail_page_data(page, control_number)
             
             if detail_data:
-                # Map legacy fields to new NAICS schema if needed
+                # Map extracted NAICS data to DataFrame columns
                 import re
-                # If we have legacy 'NAICS Code' field, map it to new schema
-                if 'NAICS Code' in detail_data and detail_data['NAICS Code']:
-                    naics_code_value = detail_data['NAICS Code']
-                    # Check if it's numeric (2-6 digits) or text (description)
-                    if re.match(r'^\d{2,6}$', str(naics_code_value).strip()):
-                        # It's a numeric code
-                        df.at[idx, 'naics_code_numeric'] = naics_code_value.strip()
-                        df.at[idx, 'naics_code'] = naics_code_value.strip()
-                    else:
-                        # It's text/title from website
-                        df.at[idx, 'naics_title'] = naics_code_value.strip()
-                        df.at[idx, 'naics_code'] = naics_code_value.strip()
-                    
-                    # Set classification method to website
-                    if 'naics_classification_method' not in detail_data:
-                        detail_data['naics_classification_method'] = 'website'
+                # If we have Georgia_SOS_NAICS field from website
+                if 'Georgia_SOS_NAICS' in detail_data and detail_data['Georgia_SOS_NAICS']:
+                    df.at[idx, 'Georgia_SOS_NAICS'] = detail_data['Georgia_SOS_NAICS']
+                    df.at[idx, 'NAICS_Source'] = 'Georgia SOS Website'
                 
-                # Map legacy 'NAICS Sub Code' to new schema
-                if 'NAICS Sub Code' in detail_data and detail_data['NAICS Sub Code']:
-                    detail_data['naics_sub_code'] = detail_data['NAICS Sub Code']
+                # Map Georgia_SOS_NAICS_Sub
+                if 'Georgia_SOS_NAICS_Sub' in detail_data and detail_data['Georgia_SOS_NAICS_Sub']:
+                    df.at[idx, 'Georgia_SOS_NAICS_Sub'] = detail_data['Georgia_SOS_NAICS_Sub']
                 
                 # Update DataFrame row with new data
                 for key, value in detail_data.items():
@@ -1288,7 +1660,7 @@ async def enrich_business_data(
                         page=page,
                         city=city,
                         state=state,
-                        google_page=None  # Reuse same page (will navigate to Google)
+                        google_page=google_page  # Use separate Google page if provided
                     )
                     
                     # Update DataFrame with contact information
@@ -1537,10 +1909,37 @@ async def main(excel_file_path: Optional[str] = None, detail_only: bool = False)
 if __name__ == "__main__":
     import sys
     
-    # Check if detail-only mode is requested
+    # Set up logging first
+    setup_logging()
+    
+    # Check command line arguments
     if len(sys.argv) > 1:
         excel_file = sys.argv[1]
-        asyncio.run(main(excel_file_path=excel_file, detail_only=True))
+        
+        # Check for enrichment mode flags
+        if len(sys.argv) > 2:
+            if sys.argv[2] == "--google-only":
+                # Google-only enrichment mode (no Cloudflare, no detail pages)
+                # Check for --headless flag
+                headless_mode = "--headless" in sys.argv or "-h" in sys.argv
+                logger.info(f"🌐 Running Google-only enrichment mode (headless={headless_mode})...")
+                asyncio.run(enrich_google_only(excel_file_path=excel_file, headless=headless_mode))
+            elif sys.argv[2] == "--apollo":
+                # Apollo enrichment mode
+                from apollo_enricher import enrich_excel_with_apollo
+                logger.info(f"🔍 Running Apollo enrichment mode...")
+                asyncio.run(enrich_excel_with_apollo(
+                    excel_file_path=excel_file,
+                    max_executives_per_company=5,
+                    only_companies_with_website=True,
+                    min_website_confidence=0.5
+                ))
+            else:
+                # Detail-only mode: Load existing Excel and enrich (includes Cloudflare bypass)
+                asyncio.run(main(excel_file_path=excel_file, detail_only=True))
+        else:
+            # Detail-only mode: Load existing Excel and enrich (includes Cloudflare bypass)
+            asyncio.run(main(excel_file_path=excel_file, detail_only=True))
     else:
         # Run full scraping
         asyncio.run(main())

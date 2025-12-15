@@ -33,24 +33,26 @@ def merge_google_facebook_data(
     """
     merged = company_record.copy()
     
-    # Source priority scores
+    # Source priority scores (higher = more trusted)
+    # Note: For WEBSITE, google_search is prioritized over facebook because
+    # Facebook often extracts invalid links like messenger.com
     SOURCE_PRIORITY = {
         'apollo': 100,
         'google_business': 90,
-        'facebook': 80,
-        'google_search': 50,
+        'google_search': 70,  # Prioritize over facebook for websites
+        'facebook': 50,  # Facebook data less reliable for websites
         'email': 40,
         'other': 20
     }
     
-    # Fields to merge with priority
+    # Fields to merge with priority (Google Business Profile disabled - using DuckDuckGo)
     fields_to_merge = {
-        'website': ['Website', 'website', 'Google_Business_Website'],
-        'phone': ['Google_Business_Phone', 'Phone', 'phone', 'contact_phone'],
+        'website': ['Website', 'website'],
+        'phone': ['Phone', 'phone', 'contact_phone'],
         'email': ['Email', 'email', 'contact_email'],
-        'address': ['Google_Business_Address', 'address', 'Principal Address', 'principal_address'],
-        'linkedin': ['LinkedIn', 'linkedin_url'],
-        'facebook': ['Facebook', 'facebook_url'],
+        'address': ['address', 'Principal Address', 'principal_address'],
+        'linkedin': ['LinkedIn'],
+        'facebook': ['Facebook'],
         'description': ['description', 'Description'],
         'category': ['category', 'Category'],
     }
@@ -205,6 +207,11 @@ def _calculate_data_quality_score(record: Dict) -> float:
     # Officers (10 points)
     max_score += 10
     officer_count = record.get('Officer_Count', 0)
+    # Convert to int if it's a string
+    try:
+        officer_count = int(officer_count) if officer_count else 0
+    except (ValueError, TypeError):
+        officer_count = 0
     if officer_count > 0:
         score += min(10, officer_count * 2)  # Up to 10 points
     
@@ -256,5 +263,15 @@ class DataAggregator:
         
         import pandas as pd
         return pd.DataFrame(aggregated_records)
+
+
+
+
+
+
+
+
+
+
 
 

@@ -29,23 +29,29 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import modules
 from scrapers import (
-    setup_logging, search_business, scrape_all_pages, enrich_business_data
+    setup_logging, search_business, scrape_all_pages, 
+    extract_detail_pages_only, enrich_google_data_only
 )
 from cloudflareSolver import get_bypassed_page
-from google_scraper import (
-    setup_google_search_context, search_google_for_website,
-    search_google_for_linkedin, search_google_for_facebook,
-    get_google_business_profile
-)
+from google_scraper_selenium import create_undetected_driver
+import undetected_chromedriver as uc
 from facebook_scraper import extract_facebook_about_details
 from naics_classifier_ai import enrich_naics_codes_ai
 from apollo_enricher import ApolloEnricher
 import json
 from filters import CompanySizeFilter, should_enrich_with_apollo
 from utils import DataAggregator, merge_google_facebook_data
-from database import SnowflakeClient
 from models import ScrapingJob
 from config import APOLLO_FILTERING
+
+# Optional Snowflake import
+try:
+    from database import SnowflakeClient
+    SNOWFLAKE_AVAILABLE = True
+except ImportError:
+    SnowflakeClient = None
+    SNOWFLAKE_AVAILABLE = False
+    logger.warning("⚠️ SnowflakeClient not available. Snowflake features will be disabled.")
 
 
 class DataCollectionPipeline:
@@ -72,13 +78,17 @@ class DataCollectionPipeline:
         
         self.snowflake_client = None
         if save_to_snowflake:
-            try:
-                self.snowflake_client = SnowflakeClient()
-                self.snowflake_client.connect()
-                self.snowflake_client.create_tables()
-            except Exception as e:
-                logger.warning(f"Could not connect to Snowflake: {str(e)}")
+            if not SNOWFLAKE_AVAILABLE or SnowflakeClient is None:
+                logger.warning("⚠️ SnowflakeClient not available. Disabling Snowflake features.")
                 self.save_to_snowflake = False
+            else:
+                try:
+                    self.snowflake_client = SnowflakeClient()
+                    self.snowflake_client.connect()
+                    self.snowflake_client.create_tables()
+                except Exception as e:
+                    logger.warning(f"Could not connect to Snowflake: {str(e)}")
+                    self.save_to_snowflake = False
         
         self.job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.job = ScrapingJob(
@@ -87,6 +97,13 @@ class DataCollectionPipeline:
             status="pending",
             started_at=datetime.utcnow()
         )
+        
+        # Store browser instances for reuse across steps
+        self.georgia_playwright = None
+        self.georgia_browser = None
+        self.georgia_context = None
+        self.georgia_page = None
+        self.google_driver = None  # Selenium undetected Chrome driver for Google
     
     async def step1_scrape_georgia_data(
         self,
@@ -114,15 +131,16 @@ class DataCollectionPipeline:
             # Get bypassed page
             target_url = "https://ecorp.sos.ga.gov/BusinessSearch"
             logger.info("🔐 Bypassing Cloudflare challenge...")
-            playwright, browser, context, page = await get_bypassed_page(target_url, headless=False)
+            self.georgia_playwright, self.georgia_browser, self.georgia_context, self.georgia_page = await get_bypassed_page(target_url, headless=False)
             
             # Search for businesses
             logger.info(f"🔍 Searching for: '{search_term}'")
-            page = await search_business(search_term, page)
+            self.georgia_page = await search_business(search_term, self.georgia_page)
             
             # Scrape all pages
             logger.info("📊 Scraping business listings...")
-            all_data = await scrape_all_pages(page, max_pages=max_pages)
+            # TEST MODE: Limit to 10 records (REMOVE AFTER TESTING)
+            all_data = await scrape_all_pages(self.georgia_page, max_pages=max_pages, max_records=1)
             
             if not all_data:
                 logger.warning("⚠️ No data scraped")
@@ -134,6 +152,26 @@ class DataCollectionPipeline:
             
             self.job.records_scraped = len(df)
             
+            # NOW: Extract ALL detail pages FIRST (before moving to next step)
+            logger.info("\n" + "="*60)
+            logger.info("📄 Extracting detail pages for ALL records...")
+            logger.info("="*60)
+            
+            # Prepare output file for detail page extraction
+            detail_output_file = None
+            if self.save_to_excel:
+                detail_output_file = self.output_dir / f"georgia_sos_with_details_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            
+            # Extract detail pages ONLY (no Google enrichment)
+            df = await extract_detail_pages_only(
+                self.georgia_page,
+                df,
+                save_progress_every=50,
+                output_file=str(detail_output_file) if detail_output_file else None
+            )
+            
+            logger.info(f"✅ Detail page extraction complete for {len(df)} records")
+            
             # Save to Snowflake
             if self.save_to_snowflake and self.snowflake_client:
                 logger.info("💾 Saving to Snowflake...")
@@ -142,7 +180,7 @@ class DataCollectionPipeline:
                     # (Implementation depends on your data structure)
                     pass
             
-            # Save to Excel
+            # Save final Excel file
             if self.save_to_excel:
                 output_file = self.output_dir / f"georgia_sos_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 df.to_excel(output_file, index=False, engine='openpyxl')
@@ -158,23 +196,85 @@ class DataCollectionPipeline:
             self.job.errors.append(f"Step 1 error: {str(e)}")
             raise
     
+    def load_data_from_file(self, file_path: str) -> pd.DataFrame:
+        """
+        Load data from Excel file to resume pipeline from a specific step
+        
+        Args:
+            file_path: Path to Excel file with company data
+            
+        Returns:
+            DataFrame with loaded data
+        """
+        try:
+            logger.info(f"📂 Loading data from: {file_path}")
+            df = pd.read_excel(file_path, engine='openpyxl')
+            logger.info(f"✅ Loaded {len(df)} records from file")
+            return df
+        except Exception as e:
+            logger.error(f"❌ Error loading file: {str(e)}")
+            raise
+    
+    def load_data_from_snowflake(self, limit: Optional[int] = None) -> pd.DataFrame:
+        """
+        Load data from Snowflake to resume pipeline from a specific step
+        
+        Args:
+            limit: Optional limit on number of records to load
+            
+        Returns:
+            DataFrame with loaded data
+        """
+        if not self.snowflake_client:
+            raise ValueError("Snowflake client not initialized. Set save_to_snowflake=True when creating pipeline.")
+        
+        try:
+            logger.info("📂 Loading data from Snowflake...")
+            
+            # Try to use get_all_company_records if available, otherwise use execute_query
+            if hasattr(self.snowflake_client, 'get_all_company_records'):
+                records = self.snowflake_client.get_all_company_records(limit=limit)
+            else:
+                # Fallback: use execute_query
+                query = """
+                    SELECT * FROM company_records
+                    ORDER BY created_at DESC
+                """
+                
+                if limit:
+                    query += f" LIMIT {limit}"
+                
+                records = self.snowflake_client.execute_query(query)
+            
+            if not records:
+                logger.warning("⚠️ No records found in Snowflake")
+                return pd.DataFrame()
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(records)
+            logger.info(f"✅ Loaded {len(df)} records from Snowflake")
+            return df
+        except Exception as e:
+            logger.error(f"❌ Error loading from Snowflake: {str(e)}")
+            raise
+    
     async def step2_google_scraping(
         self,
         df: pd.DataFrame,
         page: Optional = None
     ) -> pd.DataFrame:
         """
-        Step 2: Google scraping with validation
+        Step 2: Google scraping with validation (using Selenium + undetected-chromedriver)
         
         Args:
             df: DataFrame with company data
-            page: Optional Playwright page (will create if None)
+            page: Optional Playwright page (for email extraction from websites)
             
         Returns:
             DataFrame with Google-scraped data
         """
         logger.info("\n" + "="*60)
-        logger.info("STEP 2: Google Scraping (with Validation)")
+        logger.info("STEP 2: Google Scraping (with Validation) - Using Selenium")
         logger.info("="*60)
         
         if df.empty:
@@ -182,25 +282,32 @@ class DataCollectionPipeline:
             return df
         
         try:
-            # Setup Google search context if needed
-            if not page:
-                from playwright.async_api import async_playwright
-                playwright = await async_playwright().start()
-                browser = await playwright.chromium.launch(headless=False)
-                context = await setup_google_search_context(browser)
-                page = await context.new_page()
+            # Setup Selenium undetected Chrome driver for Google searches
+            if not self.google_driver:
+                logger.info("🌐 Setting up Selenium undetected Chrome driver for Google searches...")
+                # Run in thread pool since create_undetected_driver is synchronous
+                self.google_driver = await asyncio.to_thread(create_undetected_driver, headless=False)
+                logger.info("✅ Selenium undetected Chrome driver created")
             
-            # Enrich with Google data
-            enriched_df = await enrich_business_data(
-                page,
+            # Prepare output file for Google enrichment
+            google_output_file = None
+            if self.save_to_excel:
+                google_output_file = self.output_dir / f"enriched_google_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            
+            # Enrich with Google data ONLY (detail pages already done in Step 1)
+            # Use Georgia page for email extraction if available
+            email_extraction_page = page if page else self.georgia_page
+            enriched_df = await enrich_google_data_only(
                 df,
+                google_driver=self.google_driver,
+                page=email_extraction_page,
                 save_progress_every=50,
-                enrich_contact_info=True
+                output_file=str(google_output_file) if google_output_file else None
             )
             
             logger.info(f"✅ Google scraping complete for {len(enriched_df)} records")
             
-            # Save progress
+            # Save final progress
             if self.save_to_excel:
                 output_file = self.output_dir / f"enriched_google_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 enriched_df.to_excel(output_file, index=False, engine='openpyxl')
@@ -355,7 +462,7 @@ class DataCollectionPipeline:
         try:
             enriched_df = enrich_naics_codes_ai(
                 df,
-                excel_file_path="2022-NAICS-Codes-listed-numerically-2-Digit-through-6-Digit.xlsx",
+                excel_file_path=str(PROJECT_ROOT / "2022-NAICS-Codes-listed-numerically-2-Digit-through-6-Digit.xlsx"),
                 use_ai=True,
                 gemini_model="gemini-2.5-flash",
                 min_confidence=0.50,
@@ -506,7 +613,10 @@ class DataCollectionPipeline:
         self,
         search_term: str = "landscap",
         max_pages: Optional[int] = None,
-        skip_steps: Optional[List[int]] = None
+        skip_steps: Optional[List[int]] = None,
+        input_file: Optional[str] = None,
+        load_from_snowflake: bool = False,
+        snowflake_limit: Optional[int] = None
     ) -> pd.DataFrame:
         """
         Run the complete pipeline
@@ -514,7 +624,10 @@ class DataCollectionPipeline:
         Args:
             search_term: Search term for Georgia SOS
             max_pages: Maximum pages to scrape
-            skip_steps: List of step numbers to skip (e.g., [6] to skip Apollo)
+            skip_steps: List of step numbers to skip (e.g., [1, 6] to skip Georgia scraping and Apollo)
+            input_file: Optional path to Excel file to load data from (skips Step 1)
+            load_from_snowflake: Load data from Snowflake instead of scraping (skips Step 1)
+            snowflake_limit: Optional limit on records to load from Snowflake
             
         Returns:
             Final enriched DataFrame
@@ -530,15 +643,36 @@ class DataCollectionPipeline:
         logger.info(f"Save to Excel: {self.save_to_excel}")
         
         try:
-            # Step 1: Scrape Georgia data
-            if 1 not in skip_steps:
+            # Step 1: Scrape Georgia data OR load from file/Snowflake
+            # IMPORTANT: Check for input_file or load_from_snowflake FIRST (before checking skip_steps)
+            # This ensures we load data even if skip_steps includes 1
+            df = pd.DataFrame()
+            
+            if input_file:
+                logger.info(f"📂 Loading data from file: {input_file} (skipping Step 1)...")
+                df = self.load_data_from_file(input_file)
+                logger.info(f"✅ Loaded {len(df)} records from file")
+                if 1 not in skip_steps:
+                    skip_steps.append(1)  # Mark step 1 as skipped
+            elif load_from_snowflake:
+                logger.info("📂 Loading data from Snowflake (skipping Step 1)...")
+                df = self.load_data_from_snowflake(snowflake_limit)
+                logger.info(f"✅ Loaded {len(df)} records from Snowflake")
+                if 1 not in skip_steps:
+                    skip_steps.append(1)  # Mark step 1 as skipped
+            elif 1 not in skip_steps:
                 df = await self.step1_scrape_georgia_data(search_term, max_pages)
             else:
-                logger.info("⏭️  Skipping Step 1")
+                logger.warning("⏭️  Skipping Step 1 (no input file provided)")
                 df = pd.DataFrame()
             
             if df.empty and 1 not in skip_steps:
                 logger.error("❌ No data scraped. Stopping pipeline.")
+                return df
+            
+            if df.empty:
+                logger.error("❌ No data loaded. Cannot proceed with pipeline.")
+                logger.info("   Please provide a valid input_file or run Step 1 first.")
                 return df
             
             # Step 2: Google scraping
@@ -600,6 +734,37 @@ class DataCollectionPipeline:
             self.job.errors.append(f"Pipeline error: {str(e)}")
             raise
         finally:
+            # Cleanup browsers
+            # Close Selenium Google driver
+            if self.google_driver:
+                try:
+                    self.google_driver.quit()
+                    logger.info("✅ Closed Selenium Google driver")
+                except Exception as e:
+                    logger.debug(f"Error closing Selenium driver: {str(e)}")
+            
+            # Close Playwright browsers
+            if self.georgia_page:
+                try:
+                    await self.georgia_page.close()
+                except:
+                    pass
+            if self.georgia_context:
+                try:
+                    await self.georgia_context.close()
+                except:
+                    pass
+            if self.georgia_browser:
+                try:
+                    await self.georgia_browser.close()
+                except:
+                    pass
+            if self.georgia_playwright:
+                try:
+                    await self.georgia_playwright.stop()
+                except:
+                    pass
+            
             if self.snowflake_client:
                 self.snowflake_client.disconnect()
 
@@ -616,12 +781,25 @@ async def main():
         save_to_excel=True
     )
     
-    # Run pipeline
+    # OPTION 1: Run full pipeline from Step 1
     await pipeline.run_full_pipeline(
         search_term="landscap",
-        max_pages=5,  # Limit for testing
-        skip_steps=[]  # Run all steps
+        max_pages=None,  # Will be limited to 1 record in Step 1
+        skip_steps=[6]  
     )
+    
+    # OPTION 2: Run from NAICS step (Step 5) using aggregated data  
+    # await pipeline.run_full_pipeline(
+    #     input_file="output/aggregated_YYYYMMDD_HHMMSS.xlsx",  # Use recent aggregated file
+    #     skip_steps=[1, 2, 3, 4, 6]  # Skip Steps 1-4 (already done) and Step 6 (Apollo)
+    # )
+    
+    # OPTION 3: Run from Google scraping step using Snowflake data
+    # await pipeline.run_full_pipeline(
+    #     load_from_snowflake=True,
+    #     snowflake_limit=100,  # Optional: limit number of records
+    #     skip_steps=[1, 6]
+    # )
 
 
 if __name__ == "__main__":

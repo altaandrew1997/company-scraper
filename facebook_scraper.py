@@ -600,16 +600,29 @@ async def extract_facebook_about_details(page: Page, facebook_url: str) -> Dict:
                 '//div[contains(text(), "Website")]/following::a'
             ]
             
+            # Domains to skip (not real business websites)
+            skip_domains = [
+                'facebook.com', 'fb.me', 'messenger.com', 'instagram.com',
+                'whatsapp.com', 'meta.com', 'maps.google', 'google.com/maps',
+                'twitter.com', 'x.com', 'youtube.com', 'tiktok.com',
+                'linkedin.com', 'yelp.com', 'yellowpages.com'
+            ]
+            
             for selector in website_selectors:
                 try:
                     elements = await page.locator(selector).all()
                     for element in elements[:10]:
                         try:
                             href = await element.get_attribute('href')
-                            if href and 'facebook.com' not in href and 'maps' not in href and ('http' in href or 'www.' in href):
-                                result['website'] = href.strip()
-                                logger.debug(f"   ✅ Found website: {result['website']}")
-                                break
+                            if href:
+                                href_lower = href.lower()
+                                # Skip invalid domains
+                                if any(domain in href_lower for domain in skip_domains):
+                                    continue
+                                if 'http' in href or 'www.' in href:
+                                    result['website'] = href.strip()
+                                    logger.debug(f"   ✅ Found website: {result['website']}")
+                                    break
                         except:
                             continue
                     if result['website']:

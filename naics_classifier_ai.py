@@ -207,13 +207,41 @@ class GeminiNAICSClassifier(NAICSClassifier):
             except Exception as api_error:
                 # Handle API errors gracefully
                 error_msg = str(api_error)
-                if "quota" in error_msg.lower() or "rate" in error_msg.lower():
-                    logger.warning(f"⚠️ Rate limit/quota exceeded for {business_name}, falling back to keyword matching")
+                if "quota" in error_msg.lower() or "rate" in error_msg.lower() or "429" in error_msg:
+                    # Rate limit hit - retry with exponential backoff
+                    max_retries = 3
+                    retry_delays = [10, 30, 60]  # Seconds to wait between retries
+                    
+                    for retry_num in range(max_retries):
+                        wait_time = retry_delays[retry_num]
+                        logger.warning(f"⚠️ Rate limit hit for {business_name}, waiting {wait_time}s before retry {retry_num + 1}/{max_retries}...")
+                        time.sleep(wait_time)
+                        
+                        try:
+                            response = self.gemini_model.generate_content(
+                                prompt,
+                                generation_config=generation_config,
+                                safety_settings=safety_settings,
+                                request_options={"timeout": 30}
+                            )
+                            break  # Success - exit retry loop
+                        except Exception as retry_error:
+                            retry_msg = str(retry_error)
+                            if retry_num < max_retries - 1 and ("quota" in retry_msg.lower() or "rate" in retry_msg.lower() or "429" in retry_msg):
+                                continue  # Try again
+                            else:
+                                logger.warning(f"⚠️ Rate limit retry {retry_num + 1} failed for {business_name}, falling back to keyword matching")
+                                return None  # Fall back to keyword matching
+                    else:
+                        # All retries exhausted
+                        logger.warning(f"⚠️ All {max_retries} rate limit retries exhausted for {business_name}, falling back to keyword matching")
+                        return None
                 elif "timeout" in error_msg.lower():
                     logger.warning(f"⚠️ API timeout for {business_name}, falling back to keyword matching")
+                    return None  # Fall back to keyword matching
                 else:
                     logger.warning(f"⚠️ Gemini API error for '{business_name}': {error_msg[:100]}... falling back to keyword matching")
-                return None  # Fall back to keyword matching
+                    return None  # Fall back to keyword matching
             
             # Log response details for debugging
             logger.info(f"📥 Response received for '{business_name}':")

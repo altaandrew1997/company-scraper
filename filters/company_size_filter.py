@@ -264,3 +264,13 @@ class CompanySizeFilter:
         return companies_df.loc[candidates] if candidates else companies_df.iloc[0:0]
 
 
+
+
+
+
+
+
+
+
+
+

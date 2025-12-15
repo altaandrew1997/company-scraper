@@ -83,5 +83,12 @@ LOGGING_CONFIG = {
     "retention": "4 weeks"
 }
 
+GOOGLE_RATE_LIMIT = {
+    "min_delay": 15.0,  # Increase from 5.0 to 15.0 seconds
+    "max_delay": 30.0,  # Increase from 12.0 to 30.0 seconds
+    "requests_per_minute": 3,  # Reduce from 8 to 3 requests per minute
+    "captcha_wait_timeout": 120,
+}
+
 
 

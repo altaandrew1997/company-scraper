@@ -4,11 +4,12 @@ Orchestrates the complete data collection and enrichment process
 
 Steps:
 1. Scrape Georgia SOS data
-2. Google scraping (with validation)
-3. Facebook URL scraping
-4. Aggregate Google/Facebook data (select best values)
-5. Fix NAICS codes with Gemini
-6. Apollo enrichment (only for larger companies)
+2. Manta enrichment (PRIMARY - owner names, phone, NAICS, revenue, employees)
+3. Google scraping (SIMPLIFIED - only for missing website/LinkedIn/Facebook)
+4. Facebook URL scraping
+5. Aggregate data (select best values from all sources)
+6. Fix NAICS codes with Gemini (fallback if Manta didn't provide)
+7. Apollo enrichment (fallback for larger companies needing emails)
 """
 
 import asyncio
@@ -38,11 +39,13 @@ import undetected_chromedriver as uc
 from facebook_scraper import extract_facebook_about_details
 from naics_classifier_ai import enrich_naics_codes_ai
 from apollo_enricher import ApolloEnricher
+from manta_scraper import enrich_dataframe_with_manta
 import json
 from filters import CompanySizeFilter, should_enrich_with_apollo
 from utils import DataAggregator, merge_google_facebook_data
 from models import ScrapingJob
 from config import APOLLO_FILTERING
+from utils.business_utils import normalize_business_name
 
 # Optional Snowflake import
 try:
@@ -103,6 +106,10 @@ class DataCollectionPipeline:
         self.georgia_browser = None
         self.georgia_context = None
         self.georgia_page = None
+        self.manta_playwright = None
+        self.manta_browser = None
+        self.manta_context = None
+        self.manta_page = None
         self.google_driver = None  # Selenium undetected Chrome driver for Google
     
     async def step1_scrape_georgia_data(
@@ -139,8 +146,7 @@ class DataCollectionPipeline:
             
             # Scrape all pages
             logger.info("📊 Scraping business listings...")
-            # TEST MODE: Limit to 10 records (REMOVE AFTER TESTING)
-            all_data = await scrape_all_pages(self.georgia_page, max_pages=max_pages, max_records=1)
+            all_data = await scrape_all_pages(self.georgia_page, max_pages=max_pages)
             
             if not all_data:
                 logger.warning("⚠️ No data scraped")
@@ -149,6 +155,14 @@ class DataCollectionPipeline:
             # Convert to DataFrame
             df = pd.DataFrame(all_data)
             logger.info(f"✅ Scraped {len(df)} records from Georgia SOS")
+            
+            # Normalize business names IMMEDIATELY (Title Case + Symbols removed + LLC/INC kept)
+            if not df.empty:
+                name_col = 'Business Name' if 'Business Name' in df.columns else 'Entity Name'
+                if name_col in df.columns:
+                    logger.info(f"🧹 Normalizing {len(df)} business names...")
+                    df[name_col] = df[name_col].apply(normalize_business_name)
+                    logger.info("   ✅ Finished name normalization")
             
             self.job.records_scraped = len(df)
             
@@ -172,19 +186,39 @@ class DataCollectionPipeline:
             
             logger.info(f"✅ Detail page extraction complete for {len(df)} records")
             
-            # Save to Snowflake
+            # Save to Snowflake using upsert (insert new, update existing)
             if self.save_to_snowflake and self.snowflake_client:
-                logger.info("💾 Saving to Snowflake...")
-                for _, row in df.iterrows():
-                    # Convert to BusinessRegistryRecord and save
-                    # (Implementation depends on your data structure)
-                    pass
+                logger.info("💾 Saving to Snowflake (upsert mode)...")
+                try:
+                    rows_affected = self.snowflake_client.upsert_dataframe(df, job_id=self.job_id)
+                    logger.info(f"✅ Upserted {rows_affected} records to Snowflake")
+                except Exception as e:
+                    logger.error(f"❌ Failed to save to Snowflake: {str(e)}")
             
             # Save final Excel file
             if self.save_to_excel:
                 output_file = self.output_dir / f"georgia_sos_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
                 df.to_excel(output_file, index=False, engine='openpyxl')
                 logger.info(f"💾 Saved to: {output_file}")
+            
+            # Close Georgia browser after Step 1 is complete
+            logger.info("🔒 Closing Georgia SOS browser (Step 1 complete)...")
+            try:
+                if self.georgia_page:
+                    await self.georgia_page.close()
+                    self.georgia_page = None
+                if self.georgia_context:
+                    await self.georgia_context.close()
+                    self.georgia_context = None
+                if self.georgia_browser:
+                    await self.georgia_browser.close()
+                    self.georgia_browser = None
+                if self.georgia_playwright:
+                    await self.georgia_playwright.stop()
+                    self.georgia_playwright = None
+                logger.info("✅ Georgia SOS browser closed")
+            except Exception as e:
+                logger.debug(f"Error closing Georgia browser: {str(e)}")
             
             return df
             
@@ -258,13 +292,82 @@ class DataCollectionPipeline:
             logger.error(f"❌ Error loading from Snowflake: {str(e)}")
             raise
     
-    async def step2_google_scraping(
+    async def step2_manta_enrichment(
+        self,
+        df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Step 2: Manta enrichment (PRIMARY SOURCE)
+        Gets owner names, phone, address, NAICS, revenue, employees, opening date
+        
+        Args:
+            df: DataFrame with company data
+            
+        Returns:
+            DataFrame with Manta enrichment data
+        """
+        logger.info("\n" + "="*60)
+        logger.info("STEP 2: Manta Enrichment (PRIMARY SOURCE)")
+        logger.info("="*60)
+        logger.info("   Getting: Owner names, Phone, Address, NAICS, Revenue, Employees")
+        logger.info("="*60)
+        
+        if df.empty:
+            logger.warning("⚠️ No data to enrich")
+            return df
+        
+        try:
+            # Setup Manta browser session
+            if not self.manta_page:
+                logger.info("🔐 Setting up Manta browser session...")
+                target_url = "https://www.manta.com"
+                self.manta_playwright, self.manta_browser, self.manta_context, self.manta_page = await get_bypassed_page(target_url, headless=False)
+                logger.info("✅ Manta browser session created")
+            
+            # Prepare output file for Manta enrichment
+            manta_output_file = None
+            if self.save_to_excel:
+                manta_output_file = self.output_dir / f"enriched_manta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            
+            # Enrich with Manta data
+            enriched_df = await enrich_dataframe_with_manta(
+                df,
+                page=self.manta_page,
+                save_progress_every=50,
+                output_file=str(manta_output_file) if manta_output_file else None
+            )
+            
+            logger.info(f"✅ Manta enrichment complete for {len(enriched_df)} records")
+            
+            # Save final progress
+            if self.save_to_excel:
+                output_file = self.output_dir / f"enriched_manta_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                enriched_df.to_excel(output_file, index=False, engine='openpyxl')
+                logger.info(f"💾 Saved to: {output_file}")
+            
+            # Save to Snowflake (upsert)
+            if self.save_to_snowflake and self.snowflake_client:
+                logger.info("💾 Saving Manta enrichment to Snowflake...")
+                try:
+                    rows_affected = self.snowflake_client.upsert_dataframe(enriched_df, job_id=self.job_id)
+                    logger.info(f"✅ Upserted {rows_affected} records to Snowflake")
+                except Exception as e:
+                    logger.error(f"❌ Failed to save to Snowflake: {str(e)}")
+            
+            return enriched_df
+            
+        except Exception as e:
+            logger.error(f"❌ Error in Step 2 (Manta): {str(e)}")
+            raise
+    
+    async def step3_google_scraping(
         self,
         df: pd.DataFrame,
         page: Optional = None
     ) -> pd.DataFrame:
         """
-        Step 2: Google scraping with validation (using Selenium + undetected-chromedriver)
+        Step 3: Google scraping (SIMPLIFIED - only for missing data)
+        Only searches for website, LinkedIn, Facebook if Manta didn't provide them
         
         Args:
             df: DataFrame with company data
@@ -274,7 +377,9 @@ class DataCollectionPipeline:
             DataFrame with Google-scraped data
         """
         logger.info("\n" + "="*60)
-        logger.info("STEP 2: Google Scraping (with Validation) - Using Selenium")
+        logger.info("STEP 3: Google Scraping (SIMPLIFIED - only for missing data)")
+        logger.info("="*60)
+        logger.info("   Only searching for: Website, LinkedIn, Facebook (if not in Manta)")
         logger.info("="*60)
         
         if df.empty:
@@ -313,19 +418,28 @@ class DataCollectionPipeline:
                 enriched_df.to_excel(output_file, index=False, engine='openpyxl')
                 logger.info(f"💾 Saved to: {output_file}")
             
+            # Save to Snowflake (upsert)
+            if self.save_to_snowflake and self.snowflake_client:
+                logger.info("💾 Saving Google enrichment to Snowflake...")
+                try:
+                    rows_affected = self.snowflake_client.upsert_dataframe(enriched_df, job_id=self.job_id)
+                    logger.info(f"✅ Upserted {rows_affected} records to Snowflake")
+                except Exception as e:
+                    logger.error(f"❌ Failed to save to Snowflake: {str(e)}")
+            
             return enriched_df
             
         except Exception as e:
-            logger.error(f"❌ Error in Step 2: {str(e)}")
+            logger.error(f"❌ Error in Step 3 (Google): {str(e)}")
             raise
     
-    async def step3_facebook_scraping(
+    async def step4_facebook_scraping(
         self,
         df: pd.DataFrame,
         page: Optional = None
     ) -> Dict[str, Dict]:
         """
-        Step 3: Facebook URL scraping
+        Step 4: Facebook URL scraping
         
         Args:
             df: DataFrame with company data (should have Facebook URLs)
@@ -335,7 +449,7 @@ class DataCollectionPipeline:
             Dictionary mapping company names to Facebook data
         """
         logger.info("\n" + "="*60)
-        logger.info("STEP 3: Facebook URL Scraping")
+        logger.info("STEP 4: Facebook URL Scraping")
         logger.info("="*60)
         
         if df.empty:
@@ -378,26 +492,28 @@ class DataCollectionPipeline:
             return facebook_data
             
         except Exception as e:
-            logger.error(f"❌ Error in Step 3: {str(e)}")
+            logger.error(f"❌ Error in Step 4 (Facebook): {str(e)}")
             raise
     
-    def step4_aggregate_data(
+    def step5_aggregate_data(
         self,
         df: pd.DataFrame,
         facebook_data: Dict[str, Dict]
     ) -> pd.DataFrame:
         """
-        Step 4: Aggregate Google and Facebook data
+        Step 5: Aggregate data from all sources (Manta, Google, Facebook)
         
         Args:
-            df: DataFrame with Google-scraped data
+            df: DataFrame with enriched data from all sources
             facebook_data: Dictionary with Facebook data
             
         Returns:
             DataFrame with aggregated data
         """
         logger.info("\n" + "="*60)
-        logger.info("STEP 4: Aggregating Google & Facebook Data")
+        logger.info("STEP 5: Aggregating Data from All Sources")
+        logger.info("="*60)
+        logger.info("   Sources: Manta, Google, Facebook")
         logger.info("="*60)
         
         if df.empty:
@@ -432,18 +548,28 @@ class DataCollectionPipeline:
                 aggregated_df.to_excel(output_file, index=False, engine='openpyxl')
                 logger.info(f"💾 Saved to: {output_file}")
             
+            # Save to Snowflake (upsert)
+            if self.save_to_snowflake and self.snowflake_client:
+                logger.info("💾 Saving aggregated data to Snowflake...")
+                try:
+                    rows_affected = self.snowflake_client.upsert_dataframe(aggregated_df, job_id=self.job_id)
+                    logger.info(f"✅ Upserted {rows_affected} records to Snowflake")
+                except Exception as e:
+                    logger.error(f"❌ Failed to save to Snowflake: {str(e)}")
+            
             return aggregated_df
             
         except Exception as e:
-            logger.error(f"❌ Error in Step 4: {str(e)}")
+            logger.error(f"❌ Error in Step 5 (Aggregate): {str(e)}")
             raise
     
-    def step5_fix_naics_codes(
+    def step6_fix_naics_codes(
         self,
         df: pd.DataFrame
     ) -> pd.DataFrame:
         """
-        Step 5: Fix NAICS codes with Gemini
+        Step 6: Fix NAICS codes with Gemini (FALLBACK)
+        Only processes companies where Manta didn't provide NAICS code
         
         Args:
             df: DataFrame with company data
@@ -452,7 +578,9 @@ class DataCollectionPipeline:
             DataFrame with NAICS codes fixed/enriched
         """
         logger.info("\n" + "="*60)
-        logger.info("STEP 5: Fixing NAICS Codes with Gemini")
+        logger.info("STEP 6: Fixing NAICS Codes with Gemini (FALLBACK)")
+        logger.info("="*60)
+        logger.info("   Only processing companies without Manta NAICS code")
         logger.info("="*60)
         
         if df.empty:
@@ -460,8 +588,29 @@ class DataCollectionPipeline:
             return df
         
         try:
+            # Filter: Only process companies without NAICS code from Manta
+            # Check if NAICS Code exists and source is Manta
+            companies_with_manta_naics = df[
+                (df['NAICS Code'].notna()) & 
+                (df['NAICS Code'] != '') & 
+                (df['NAICS_Source'] == 'Manta')
+            ]
+            companies_without_naics = df[
+                (df['NAICS Code'].isna()) | 
+                (df['NAICS Code'] == '') |
+                (df['NAICS_Source'] != 'Manta')
+            ]
+            
+            logger.info(f"   📊 Companies with Manta NAICS: {len(companies_with_manta_naics)}")
+            logger.info(f"   📊 Companies needing Gemini NAICS: {len(companies_without_naics)}")
+            
+            if len(companies_without_naics) == 0:
+                logger.info("   ✅ All companies already have Manta NAICS codes - skipping Gemini")
+                return df
+            
+            # Only enrich companies without Manta NAICS
             enriched_df = enrich_naics_codes_ai(
-                df,
+                companies_without_naics,
                 excel_file_path=str(PROJECT_ROOT / "2022-NAICS-Codes-listed-numerically-2-Digit-through-6-Digit.xlsx"),
                 use_ai=True,
                 gemini_model="gemini-2.5-flash",
@@ -471,6 +620,15 @@ class DataCollectionPipeline:
                 output_file_path=None  # Will save at end
             )
             
+            # Merge back: companies with Manta NAICS + companies with Gemini NAICS
+            # Update the original dataframe with Gemini results
+            for idx in enriched_df.index:
+                for col in enriched_df.columns:
+                    if col in df.columns and pd.notna(enriched_df.at[idx, col]):
+                        df.at[idx, col] = enriched_df.at[idx, col]
+            
+            enriched_df = df  # Use full dataframe
+            
             logger.info(f"✅ NAICS code enrichment complete")
             
             # Save progress
@@ -479,18 +637,29 @@ class DataCollectionPipeline:
                 enriched_df.to_excel(output_file, index=False, engine='openpyxl')
                 logger.info(f"💾 Saved to: {output_file}")
             
+            # Save to Snowflake (upsert)
+            if self.save_to_snowflake and self.snowflake_client:
+                logger.info("💾 Saving NAICS enrichment to Snowflake...")
+                try:
+                    rows_affected = self.snowflake_client.upsert_dataframe(enriched_df, job_id=self.job_id)
+                    logger.info(f"✅ Upserted {rows_affected} records to Snowflake")
+                except Exception as e:
+                    logger.error(f"❌ Failed to save to Snowflake: {str(e)}")
+            
             return enriched_df
             
         except Exception as e:
-            logger.error(f"❌ Error in Step 5: {str(e)}")
+            logger.error(f"❌ Error in Step 6 (NAICS): {str(e)}")
             raise
     
-    async def step6_apollo_enrichment(
+    async def step7_apollo_enrichment(
         self,
         df: pd.DataFrame
     ) -> pd.DataFrame:
         """
-        Step 6: Apollo enrichment (only for larger companies)
+        Step 7: Apollo enrichment (FALLBACK for larger companies)
+        Only for companies needing executive emails/LinkedIn
+        Manta already provides owner names for small businesses
         
         Args:
             df: DataFrame with company data
@@ -499,7 +668,10 @@ class DataCollectionPipeline:
             DataFrame with Apollo enrichment data
         """
         logger.info("\n" + "="*60)
-        logger.info("STEP 6: Apollo Enrichment (Filtered for Larger Companies)")
+        logger.info("STEP 7: Apollo Enrichment (FALLBACK - Filtered for Larger Companies)")
+        logger.info("="*60)
+        logger.info("   Only for companies needing executive emails/LinkedIn")
+        logger.info("   (Manta already provides owner names for small businesses)")
         logger.info("="*60)
         
         if df.empty:
@@ -603,10 +775,19 @@ class DataCollectionPipeline:
                 df.to_excel(output_file, index=False, engine='openpyxl')
                 logger.info(f"💾 Saved to: {output_file}")
             
+            # Save to Snowflake (upsert)
+            if self.save_to_snowflake and self.snowflake_client:
+                logger.info("💾 Saving Apollo enrichment to Snowflake...")
+                try:
+                    rows_affected = self.snowflake_client.upsert_dataframe(df, job_id=self.job_id)
+                    logger.info(f"✅ Upserted {rows_affected} records to Snowflake")
+                except Exception as e:
+                    logger.error(f"❌ Failed to save to Snowflake: {str(e)}")
+            
             return df
             
         except Exception as e:
-            logger.error(f"❌ Error in Step 6: {str(e)}")
+            logger.error(f"❌ Error in Step 7 (Apollo): {str(e)}")
             raise
     
     async def run_full_pipeline(
@@ -675,36 +856,42 @@ class DataCollectionPipeline:
                 logger.info("   Please provide a valid input_file or run Step 1 first.")
                 return df
             
-            # Step 2: Google scraping
+            # Step 2: Manta enrichment (NEW - PRIMARY SOURCE for owner names, phone, NAICS)
             if 2 not in skip_steps:
-                df = await self.step2_google_scraping(df)
+                df = await self.step2_manta_enrichment(df)
             else:
-                logger.info("⏭️  Skipping Step 2")
+                logger.info("⏭️  Skipping Step 2 (Manta)")
             
-            # Step 3: Facebook scraping
-            facebook_data = {}
+            # Step 3: Google scraping (SIMPLIFIED - only for missing data)
             if 3 not in skip_steps:
-                facebook_data = await self.step3_facebook_scraping(df)
+                df = await self.step3_google_scraping(df)
             else:
-                logger.info("⏭️  Skipping Step 3")
+                logger.info("⏭️  Skipping Step 3 (Google)")
             
-            # Step 4: Aggregate data
+            # Step 4: Facebook scraping
+            facebook_data = {}
             if 4 not in skip_steps:
-                df = self.step4_aggregate_data(df, facebook_data)
+                facebook_data = await self.step4_facebook_scraping(df)
             else:
-                logger.info("⏭️  Skipping Step 4")
+                logger.info("⏭️  Skipping Step 4 (Facebook)")
             
-            # Step 5: Fix NAICS codes
+            # Step 5: Aggregate data
             if 5 not in skip_steps:
-                df = self.step5_fix_naics_codes(df)
+                df = self.step5_aggregate_data(df, facebook_data)
             else:
-                logger.info("⏭️  Skipping Step 5")
+                logger.info("⏭️  Skipping Step 5 (Aggregate)")
             
-            # Step 6: Apollo enrichment
+            # Step 6: Fix NAICS codes (fallback if Manta didn't provide)
             if 6 not in skip_steps:
-                df = await self.step6_apollo_enrichment(df)
+                df = self.step6_fix_naics_codes(df)
             else:
-                logger.info("⏭️  Skipping Step 6")
+                logger.info("⏭️  Skipping Step 6 (NAICS)")
+            
+            # Step 7: Apollo enrichment (fallback for larger companies needing emails)
+            if 7 not in skip_steps:
+                df = await self.step7_apollo_enrichment(df)
+            else:
+                logger.info("⏭️  Skipping Step 7 (Apollo)")
             
             # Final save
             if self.save_to_excel:
@@ -765,6 +952,28 @@ class DataCollectionPipeline:
                 except:
                     pass
             
+            # Close Manta browser
+            if self.manta_page:
+                try:
+                    await self.manta_page.close()
+                except:
+                    pass
+            if self.manta_context:
+                try:
+                    await self.manta_context.close()
+                except:
+                    pass
+            if self.manta_browser:
+                try:
+                    await self.manta_browser.close()
+                except:
+                    pass
+            if self.manta_playwright:
+                try:
+                    await self.manta_playwright.stop()
+                except:
+                    pass
+            
             if self.snowflake_client:
                 self.snowflake_client.disconnect()
 
@@ -777,28 +986,28 @@ async def main():
     # Create and run pipeline
     pipeline = DataCollectionPipeline(
         output_dir="output",
-        save_to_snowflake=True,
+        save_to_snowflake=True,  # Enable Snowflake saving
         save_to_excel=True
     )
     
-    # OPTION 1: Run full pipeline from Step 1
+    # Run full pipeline from Step 1 to Step 6 (all steps)
     await pipeline.run_full_pipeline(
         search_term="landscap",
-        max_pages=None,  # Will be limited to 1 record in Step 1
-        skip_steps=[6]  
+        max_pages=20,  
+        skip_steps=[] 
     )
     
-    # OPTION 2: Run from NAICS step (Step 5) using aggregated data  
+    # OPTION 2: Run from specific step using existing file
     # await pipeline.run_full_pipeline(
-    #     input_file="output/aggregated_YYYYMMDD_HHMMSS.xlsx",  # Use recent aggregated file
-    #     skip_steps=[1, 2, 3, 4, 6]  # Skip Steps 1-4 (already done) and Step 6 (Apollo)
+    #     input_file="output/naics_enriched_YYYYMMDD_HHMMSS.xlsx",
+    #     skip_steps=[1, 2, 3, 4, 5]  # Only run Step 6 (Apollo)
     # )
     
-    # OPTION 3: Run from Google scraping step using Snowflake data
+    # OPTION 3: Run from Snowflake data
     # await pipeline.run_full_pipeline(
     #     load_from_snowflake=True,
-    #     snowflake_limit=100,  # Optional: limit number of records
-    #     skip_steps=[1, 6]
+    #     snowflake_limit=100,
+    #     skip_steps=[1]
     # )
 
 

@@ -1031,13 +1031,18 @@ async def get_bypassed_page(
     
     if context:
         page = await context.new_page()
-        await page.goto(target_url)
-        await page.wait_for_load_state("domcontentloaded")
+        try:
+            # Use domcontentloaded instead of default load (which waits for all resources)
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            logger.warning(f"⚠️ Session navigation timeout: {str(e)[:50]}... - will create new session")
+            await context.close()
+            context = None
         
-        if await is_session_valid(page):
+        if context and await is_session_valid(page):
             logger.info("✅ Saved session is still valid!")
             return (playwright_instance, browser, context, page)
-        else:
+        elif context:
             await context.close()
             context = None
     

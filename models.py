@@ -82,6 +82,9 @@ class EnrichedCompanyRecord(BaseModel):
     naics_description: Optional[str] = None
     industry_keywords: Optional[List[str]] = None
     
+    # Platform links
+    manta_map_url: Optional[str] = None
+    
     # Data quality metrics
     data_quality_score: Optional[float] = Field(None, ge=0.0, le=1.0)
     enrichment_status: str = "pending"  # pending, completed, failed
